@@ -106,6 +106,10 @@ class _Message:
     data: bytes
 
 
+class PoseSyncError(ValueError):
+    """An image timestamp cannot be paired with a valid interpolated pose."""
+
+
 def _align(offset: int, alignment: int) -> int:
     return 4 + (((offset - 4) + alignment - 1) & ~(alignment - 1))
 
@@ -297,14 +301,14 @@ class PoseTrack:
     def interpolate(self, timestamp_ns: int, *, max_dt_ns: int) -> np.ndarray:
         index = bisect.bisect_left(self._timestamps, int(timestamp_ns))
         if index == 0 or index == len(self._timestamps):
-            raise ValueError("Image timestamp is outside odometry coverage")
+            raise PoseSyncError("Image timestamp is outside odometry coverage")
         if self._timestamps[index] == timestamp_ns:
             return self._poses[index].copy()
         left, right = index - 1, index
         dt_left = timestamp_ns - self._timestamps[left]
         dt_right = self._timestamps[right] - timestamp_ns
         if min(dt_left, dt_right) > max_dt_ns or self._timestamps[right] - self._timestamps[left] > 2 * max_dt_ns:
-            raise ValueError("Image timestamp has no valid odometry bracket")
+            raise PoseSyncError("Image timestamp has no valid odometry bracket")
         alpha = dt_left / (self._timestamps[right] - self._timestamps[left])
         q0 = _matrix_to_quaternion(self._poses[left][:3, :3])
         q1 = _matrix_to_quaternion(self._poses[right][:3, :3])
@@ -464,17 +468,29 @@ class RosbagReader:
         self._poses = PoseTrack(poses)
         self._max_sync_dt_ns = int(round(max_sync_dt_ms * 1_000_000))
         self._lidar_from_camera = np.linalg.inv(self.calibration.t_camera_from_lidar)
+        self._skipped_pose_frames = 0
 
     def __len__(self) -> int:
         return len(self._images)
 
+    @property
+    def skipped_pose_frames(self) -> int:
+        """Number of image frames skipped by the most recent frames() call."""
+        return self._skipped_pose_frames
+
     def frames(self, *, start: int = 0, limit: int | None = None) -> list[BagFrame]:
         if start < 0 or (limit is not None and limit < 1):
             raise ValueError("start must be non-negative and limit must be positive")
-        selected = self._images[start:] if limit is None else self._images[start : start + limit]
+        self._skipped_pose_frames = 0
         result = []
-        for index, image in enumerate(selected, start=start):
-            result.append(self._build_frame(index, image))
+        for index, image in enumerate(self._images[start:], start=start):
+            try:
+                result.append(self._build_frame(index, image))
+            except PoseSyncError:
+                self._skipped_pose_frames += 1
+                continue
+            if limit is not None and len(result) >= limit:
+                break
         return result
 
     def _build_frame(self, index: int, image: _Message) -> BagFrame:

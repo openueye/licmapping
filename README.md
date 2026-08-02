@@ -39,6 +39,11 @@ python -m lic_mapping.trainer \
   --iterations 30
 ```
 
+Images without an interpolable odometry pose, such as the startup gap in
+some bags, are skipped automatically. The CLI reports the skipped count in
+its JSON output and records it in the checkpoint report; image, point-cloud,
+and calibration errors remain hard failures.
+
 This is intentionally a minimal backend baseline. It does not yet implement
 SAGE's centered-five source fusion, SPNet prior, pruning policy, or formal
 artifact receipts.

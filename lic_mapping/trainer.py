@@ -77,8 +77,8 @@ class LICMappingTrainer:
         optimizer = self._optimizer(model)
         keyframes: list[BagFrame] = [first]
         records: list[dict[str, object]] = []
-        for frame in frames:
-            if frame.index != 0:
+        for step, frame in enumerate(frames):
+            if step != 0:
                 added = model.append_frame(
                     frame,
                     optimizer=optimizer,
@@ -87,7 +87,7 @@ class LICMappingTrainer:
                 )
             else:
                 added = 0
-            if frame.index % self.config.keyframe_every == 0 and frame.index != 0:
+            if step % self.config.keyframe_every == 0 and step != 0:
                 keyframes.append(frame)
             loss_record = self._optimize_frame(model, optimizer, frame, keyframes)
             loss_record["frame_index"] = frame.index
@@ -180,10 +180,16 @@ def _main(argv: list[str] | None = None) -> int:
         max_new_points_per_frame=args.max_new_points,
     )
     model, report = LICMappingTrainer(config, device=args.device).fit(frames)
+    report["skipped_pose_frames"] = reader.skipped_pose_frames
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "report": report}, args.output)
     args.output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps({"output": str(args.output), "gaussian_count": model.count, "frames": len(frames)}))
+    print(json.dumps({
+        "output": str(args.output),
+        "gaussian_count": model.count,
+        "frames": len(frames),
+        "skipped_pose_frames": reader.skipped_pose_frames,
+    }))
     return 0
 
 

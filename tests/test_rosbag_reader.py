@@ -125,17 +125,20 @@ def test_rosbag_reader_builds_fixed_pose_frame(tmp_path: Path) -> None:
         connection.executemany(
             "INSERT INTO messages(topic_id, timestamp, data) VALUES (?, ?, ?)",
             [
-                (1, 500_000_000, _image(500_000_000)),
-                (2, 0, _odom(0, 0.0)),
-                (2, 1_000_000_000, _odom(1_000_000_000, 1.0)),
-                (3, 500_000_000, _cloud(500_000_000)),
+                (1, 0, _image(0)),
+                (1, 550_000_000, _image(550_000_000)),
+                (2, 500_000_000, _odom(500_000_000, 0.0)),
+                (2, 600_000_000, _odom(600_000_000, 1.0)),
+                (3, 550_000_000, _cloud(550_000_000)),
             ],
         )
         connection.commit()
 
-    frames = RosbagReader(bag, bag / "cam_in_ex.txt", max_sync_dt_ms=500.0).frames()
+    reader = RosbagReader(bag, bag / "cam_in_ex.txt", max_sync_dt_ms=100.0)
+    frames = reader.frames()
 
     assert len(frames) == 1
+    assert reader.skipped_pose_frames == 1
     assert frames[0].rgb.shape == (8, 8, 3)
     assert np.isclose(frames[0].world_from_camera[0, 3], 0.5)
     assert frames[0].points_world.shape == (3, 3)

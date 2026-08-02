@@ -1,0 +1,31 @@
+# Copy to downtown1.local.yaml for this workspace. The formal downtown1_sh*.yaml
+# files remain frozen reproduction configurations.
+schema_version: 1
+
+input:
+  rosbag: ../../../03_Datasets/001_rosbags/Downtown1
+  calibration: ../../../03_Datasets/001_rosbags/Downtown1/cam_in_ex.txt
+  device: cuda
+  resize_width: 640
+  resize_height: 512
+  depth_adapter: single_cloud_zbuffer
+  sync_tolerance_ms: 10.0
+  cloud_tolerance_ms: 10.0
+
+output:
+  checkpoint: ../../../05_Outputs/Downtown1/licmapping/Downtown1_sh0.pt
+  artifact_dir: ../../../05_Outputs/Downtown1/licmapping/Downtown1_sh0_artifacts
+  save_artifacts: true
+
+training:
+  sh_degree: 0
+
+spnet:
+  engine: null
+  torchscript: null
+  weights: ../../../00_Baselines/SAGE-GS/models/Large_300.pth
+  source: ../../../00_Baselines/SAGE-GS/third_party/SPNet
+  alignment: experimental_pytorch_adapter
+
+evaluation:
+  lpips_backbone: ../../../00_Baselines/SAGE-GS/models/alexnet-owt-7be5be79.pth

@@ -9,6 +9,7 @@ CONFIG_SCHEMA_VERSION = 1
 _SECTION_KEYS = {
     "input": {
         "rosbag", "calibration", "device", "frame_limit", "resize_width", "resize_height",
+        "depth_adapter", "sync_tolerance_ms", "cloud_tolerance_ms",
     },
     "output": {"checkpoint", "artifact_dir", "save_artifacts"},
     "training": {
@@ -21,7 +22,7 @@ _SECTION_KEYS = {
         "depth_weight", "iteration_decay", "depth_completion_patch_size",
         "depth_completion_max_depth_m", "depth_completion_confidence",
     },
-    "spnet": {"engine", "torchscript", "weights", "source"},
+    "spnet": {"engine", "torchscript", "weights", "source", "alignment"},
     "evaluation": {"lpips_backbone"},
 }
 

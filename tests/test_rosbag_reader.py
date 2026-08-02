@@ -11,9 +11,8 @@ from lic_mapping.rosbag import (
     CameraIntrinsics,
     RosbagReader,
     SOURCE_CENTER,
-    _CenteredFiveProjector,
-    _SourceSlot,
-    _lic2_output_geometry,
+    _output_geometry,
+    _project_visible_cloud,
     parse_calibration,
 )
 
@@ -151,18 +150,19 @@ def test_rosbag_reader_builds_fixed_pose_frame(tmp_path: Path) -> None:
     assert len(frames) == 1
     assert reader.skipped_pose_frames == 1
     assert frames[0].rgb.shape == (8, 8, 3)
+    assert frames[0].index == 1
     assert np.isclose(frames[0].world_from_camera[0, 3], 0.0)
     assert frames[0].points_world.shape == (3, 3)
     assert np.count_nonzero(frames[0].depth_m) > 0
     assert np.all(frames[0].source_types[frames[0].depth_m > 0] == SOURCE_CENTER)
 
 
-def test_lic2_output_geometry_center_crops_before_resize(tmp_path: Path) -> None:
+def test_output_geometry_center_crops_before_resize(tmp_path: Path) -> None:
     calibration_path = tmp_path / "cam_in_ex.txt"
     _calibration(calibration_path)
     calibration = parse_calibration(calibration_path)
 
-    intrinsics, crop = _lic2_output_geometry(calibration, (4, 8))
+    intrinsics, crop = _output_geometry(calibration, (4, 8))
 
     assert crop == (2, 0, 4, 8)
     assert (intrinsics.width, intrinsics.height) == (4, 8)
@@ -172,20 +172,26 @@ def test_lic2_output_geometry_center_crops_before_resize(tmp_path: Path) -> None
     )
 
 
-def test_centered_five_rejects_conflict_but_restores_center() -> None:
-    intrinsics = CameraIntrinsics(8, 8, 4.0, 4.0, 3.0, 3.0)
-    rgb = np.zeros((8, 8, 3), dtype=np.float32)
-    pose = np.eye(4, dtype=np.float64)
-    slots = []
-    for index in range(5):
-        depth = 2.0 if index == 2 else (4.0 if index == 0 else 0.0)
-        points = np.asarray([[0.0, 0.0, depth]], dtype=np.float32) if depth else np.empty((0, 3), dtype=np.float32)
-        slots.append(_SourceSlot(index, index, rgb, pose, points))
-    center, fused = _CenteredFiveProjector(intrinsics).project(tuple(slots))
-    assert np.isclose(center[3, 3], 2.0)
-    assert np.isclose(fused[3, 3], 2.0)
+def test_projected_cloud_retains_only_zbuffer_winners() -> None:
+    intrinsics = CameraIntrinsics(8, 8, 4.0, 4.0, 4.0, 4.0)
+    points = np.asarray(
+        [
+            (0.0, 0.0, 3.0),  # Occluded by the next point at the same pixel.
+            (0.0, 0.0, 2.0),
+            (10.0, 0.0, 2.0),  # Outside the image.
+            (0.0, 0.0, -1.0),  # Behind the camera.
+        ],
+        dtype=np.float32,
+    )
 
-    slots[2] = _SourceSlot(2, 2, rgb, pose, np.empty((0, 3), dtype=np.float32))
-    center, fused = _CenteredFiveProjector(intrinsics).project(tuple(slots))
-    assert np.isclose(center[3, 3], 0.0)
-    assert np.isclose(fused[3, 3], 4.0)
+    depth, indices = _project_visible_cloud(
+        points,
+        np.eye(4),
+        intrinsics,
+        min_depth=0.1,
+        max_depth=200.0,
+    )
+
+    assert np.array_equal(indices, np.asarray([1]))
+    assert np.count_nonzero(depth) == 1
+    assert depth[4, 4] == np.float32(2.0)

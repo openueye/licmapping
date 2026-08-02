@@ -147,6 +147,7 @@ class CallableDepthCompleter:
         if depth_scale_m <= 0 or not np.isfinite(depth_scale_m):
             raise ValueError("depth_scale_m must be positive and finite")
         self.predictor = predictor
+        self.alignment = "test_adapter"
         self.depth_scale_m = float(depth_scale_m)
         self.device = torch.device(device)
 
@@ -184,6 +185,7 @@ class TorchScriptDepthCompleter(CallableDepthCompleter):
         except Exception as exc:
             raise RuntimeError(f"Cannot load SPNet TorchScript model: {path}") from exc
         super().__init__(network, depth_scale_m=depth_scale_m, device=target)
+        self.alignment = "experimental_torchscript_adapter"
         self.model_path = path
 
     def complete(self, rgb: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
@@ -222,6 +224,7 @@ class SPNetDepthCompleter:
         self.source_tree_sha256 = SPNET_SOURCE_TREE_SHA256
         self.depth_scale_m = float(depth_scale_m)
         self.device = target
+        self.alignment = "experimental_pytorch_adapter"
         self.predictor = _load_spnet_network(self.source_root, path, target)
 
     def complete(self, rgb: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
@@ -304,6 +307,7 @@ class TensorRTDepthCompleter:
         self.height = int(height)
         self.device = target
         self.depth_scale_m = float(depth_scale_m)
+        self.alignment = "native_tensorrt"
         self._inputs = []
         self._outputs = []
         for index in range(engine.num_io_tensors):

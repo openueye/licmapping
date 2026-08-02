@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import importlib.util
 from pathlib import Path
+import sys
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -11,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 ROOT = Path(__file__).resolve().parent
 DEFAULT_REFERENCE = (
     ROOT.parents[1]
-    / "06_CodeRefference"
+    / "06_Referrance"
     / "Gaussian-LIC"
     / "src"
 )
@@ -22,7 +23,7 @@ REFERENCE_SRC = Path(
 if not (REFERENCE_SRC / "rasterizer" / "rasterizer.cpp").is_file():
     raise RuntimeError(
         "LIC reference source is missing. Set LIC_REFERENCE_SRC to "
-        "06_CodeRefference/Gaussian-LIC/src."
+        "06_Referrance/Gaussian-LIC/src."
     )
 
 RASTERIZER_SRC = REFERENCE_SRC / "rasterizer"
@@ -43,6 +44,7 @@ def _glm_include() -> str:
         )
     candidates.extend(
         [
+            Path(sys.prefix) / "include",
             REFERENCE_SRC.parent.parent / "third_party" / "glm",
             Path("/usr/include"),
             Path("/usr/local/include"),

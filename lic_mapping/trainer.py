@@ -24,7 +24,7 @@ from .spnet import DepthCompleter, complete_keyframe_points
 class TrainingConfig:
     iterations_per_frame: int = 100
     keyframe_every: int = 5
-    replay_keyframes: int = 0  # retained for checkpoint/config compatibility; LIC2 uses all train keyframes
+    replay_keyframes: int = 0  # Retained for checkpoint/config compatibility; training uses all train keyframes.
     max_initial_points: int | None = None
     max_new_points_per_frame: int | None = None
     initial_opacity: float = 0.1
@@ -153,7 +153,7 @@ class _KeyframeView:
 
 
 class LICMappingTrainer:
-    """Sequential fixed-pose mapper using SAGE's CUDA rasterizer."""
+    """Sequential fixed-pose mapper using Gaussian-LIC's CUDA rasterizer."""
 
     def __init__(self, config: TrainingConfig, *, device: torch.device | str = "cuda", depth_completer: DepthCompleter | None = None) -> None:
         self.config = config
@@ -166,6 +166,7 @@ class LICMappingTrainer:
             raise ValueError("depth_completion=True requires a DepthCompleter")
         self.depth_completer = depth_completer
         self.last_keyframes: list[_KeyframeView] = []
+        self.last_test_views: list[_KeyframeView] = []
         self.last_depth_completion: list[dict[str, object]] = []
 
     def fit(self, frames: Iterable[BagFrame]) -> tuple[GaussianMap, dict[str, object]]:
@@ -177,13 +178,16 @@ class LICMappingTrainer:
         model: GaussianMap | None = None
         optimizer: SparseGaussianAdam | None = None
         keyframes: list[_KeyframeView] = []
+        test_views: list[_KeyframeView] = []
         records: list[dict[str, object]] = []
         accepted_frames = 0
         keyframe_count = 0
         for frame in frames:
             accepted_frames += 1
             accumulator.add(frame)
+            view = _keyframe_view(frame)
             if accepted_frames % self.config.keyframe_every != 0:
+                test_views.append(view)
                 continue
             completion_record: dict[str, object] = {"enabled": self.config.depth_completion, "added": 0}
             if self.config.depth_completion:
@@ -234,7 +238,7 @@ class LICMappingTrainer:
                     alpha_gate=True,
                     pixel_dedup=True,
                 )
-            keyframes.append(_keyframe_view(frame))
+            keyframes.append(view)
             keyframe_count += 1
             assert model is not None and optimizer is not None
             loss_record = self._optimize_keyframe(model, optimizer, keyframes)
@@ -281,6 +285,7 @@ class LICMappingTrainer:
         report = {
             "frames": accepted_frames,
             "keyframes": keyframe_count,
+            "test_views": len(test_views),
             "gaussian_count": model.count,
             "training": asdict(self.config),
             "history": records,
@@ -291,6 +296,7 @@ class LICMappingTrainer:
             "depth_completion": {
                 "enabled": self.config.depth_completion,
                 "backend": type(self.depth_completer).__name__ if self.depth_completer is not None else None,
+                "alignment": getattr(self.depth_completer, "alignment", "disabled") if self.depth_completer is not None else "disabled",
                 "identity": spnet_identity,
                 "patch_size": self.config.depth_completion_patch_size,
                 "max_depth_m": self.config.depth_completion_max_depth_m,
@@ -298,6 +304,7 @@ class LICMappingTrainer:
             },
         }
         self.last_keyframes = keyframes
+        self.last_test_views = test_views
         return model, report
 
     def _optimizer(self, model: GaussianMap) -> SparseGaussianAdam:
@@ -474,6 +481,9 @@ def _main(argv: list[str] | None = None) -> int:
     frame_limit = configured("input", "frame_limit", args.frame_limit, None)
     resize_width = configured("input", "resize_width", args.resize_width, None)
     resize_height = configured("input", "resize_height", args.resize_height, None)
+    depth_adapter = str(configured("input", "depth_adapter", None, "single_cloud_zbuffer"))
+    sync_tolerance_ms = float(configured("input", "sync_tolerance_ms", None, 10.0))
+    cloud_tolerance_ms = float(configured("input", "cloud_tolerance_ms", None, 10.0))
     if (args.resize_width is None) != (args.resize_height is None):
         parser.error("--resize-width and --resize-height must be provided together")
     if (resize_width is None) != (resize_height is None):
@@ -525,7 +535,14 @@ def _main(argv: list[str] | None = None) -> int:
         **training_values,
         depth_completion=any(value is not None for value in backends),
     )
-    reader = RosbagReader(rosbag, calibration, resize=resize)
+    reader = RosbagReader(
+        rosbag,
+        calibration,
+        resize=resize,
+        depth_adapter=depth_adapter,
+        max_sync_dt_ms=sync_tolerance_ms,
+        max_cloud_dt_ms=cloud_tolerance_ms,
+    )
     frames = reader.frames(limit=frame_limit)
     completer = None
     if spnet_engine is not None:
@@ -543,10 +560,19 @@ def _main(argv: list[str] | None = None) -> int:
             source_root=spnet_source,
             device=device,
         )
+    declared_spnet_alignment = configured("spnet", "alignment", None, None)
+    if declared_spnet_alignment is not None:
+        actual_spnet_alignment = getattr(completer, "alignment", "disabled") if completer is not None else "disabled"
+        if str(declared_spnet_alignment) != actual_spnet_alignment:
+            parser.error(
+                "Configured spnet.alignment does not match the selected backend: "
+                f"expected {declared_spnet_alignment}, got {actual_spnet_alignment}"
+            )
     trainer = LICMappingTrainer(config, device=device, depth_completer=completer)
     model, report = trainer.fit(frames)
     report["skipped_pose_frames"] = reader.skipped_pose_frames
     report["rejected_source_frames"] = reader.rejected_source_frames
+    report["input_adapter"] = reader.input_adapter
     if config_path is not None:
         report["config_file"] = str(config_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -564,6 +590,7 @@ def _main(argv: list[str] | None = None) -> int:
             model,
             trainer.last_keyframes,
             artifact_dir,
+            test_views=trainer.last_test_views,
             lpips_backbone=lpips_backbone,
         )
         report["evaluation"] = {

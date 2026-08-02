@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from .gaussians import GaussianMap
 
 
-EVALUATION_SCHEMA = "lic2-final-evaluation-v1"
+EVALUATION_SCHEMA = "gaussian-lic-final-evaluation-v2"
 SAGE_METRIC_SCHEMA = "sage-image-metrics-v1"
 TORCHMETRICS_VERSION = "1.9.0"
 TORCHVISION_VERSION_PREFIX = "0.20.1"
@@ -184,75 +184,71 @@ def _sage_photometric_loss(
 
 def evaluate_final_map(
     model: GaussianMap,
-    keyframes: Iterable[object],
+    train_views: Iterable[object],
     output_dir: Path,
     *,
+    test_views: Iterable[object] = (),
     lpips_backbone: Path | None = None,
 ) -> dict[str, object]:
-    """Write LIC2-compatible final metrics and inspection artifacts.
-
-    The evaluator consumes retained keyframe views, so evaluation remains
-    bounded by the number of training views rather than the complete ROSBAG.
-    Raw arrays are saved alongside PNGs to keep visualizations auditable.
-    """
+    """Write separate Gaussian-LIC train and test view artifacts and metrics."""
 
     root = Path(output_dir)
-    for name in ("renders/rgb", "renders/target", "renders/depth", "renders/alpha", "renders/error", "arrays"):
-        (root / name).mkdir(parents=True, exist_ok=True)
     image_metrics = SAGEImageMetricEvaluator(model.means3d.device, backbone=lpips_backbone)
-    rows: list[dict[str, object]] = []
+    rows_by_split: dict[str, list[dict[str, object]]] = {"train": [], "test": []}
     with torch.inference_mode():
-        for view in keyframes:
-            output = model.render(view.camera)
-            rendered_rgb = output.rgb.clamp(0, 1)
-            target_rgb = torch.from_numpy(view.rgb).permute(2, 0, 1).to(model.means3d.device)
-            rendered_depth = output.depth.squeeze()
-            target_depth = torch.from_numpy(view.depth_m).to(model.means3d.device)
-            alpha = (1.0 - output.final_transmittance.squeeze()).clamp(0, 1)
-            quality = image_metrics(
-                rendered_rgb.permute(1, 2, 0),
-                target_rgb.permute(1, 2, 0),
-            )
-            depth_valid = (target_depth > 0) & (rendered_depth > 0) & torch.isfinite(rendered_depth)
-            if bool(depth_valid.any()):
-                depth_mae = float((rendered_depth[depth_valid] - target_depth[depth_valid]).abs().mean())
-            else:
-                depth_mae = None
-            stem = f"{int(view.index):06d}"
-            rendered_np = rendered_rgb.permute(1, 2, 0).cpu().numpy()
-            target_np = target_rgb.permute(1, 2, 0).cpu().numpy()
-            _write_rgb(root / "renders/rgb" / f"{stem}.png", rendered_np)
-            _write_rgb(root / "renders/target" / f"{stem}.png", target_np)
-            rendered_depth_np = rendered_depth.cpu().numpy().astype(np.float32)
-            target_depth_np = target_depth.cpu().numpy().astype(np.float32)
-            alpha_np = alpha.cpu().numpy().astype(np.float32)
-            np.save(root / "arrays" / f"{stem}_rendered_depth.npy", rendered_depth_np)
-            np.save(root / "arrays" / f"{stem}_target_depth.npy", target_depth_np)
-            np.save(root / "arrays" / f"{stem}_alpha.npy", alpha_np)
-            _write_depth(root / "renders/depth" / f"{stem}.png", rendered_depth_np)
-            _write_depth(root / "renders/depth" / f"{stem}_target.png", target_depth_np)
-            cv2.imwrite(str(root / "renders/alpha" / f"{stem}.png"), (alpha_np * 255).clip(0, 255).astype(np.uint8))
-            error = np.abs(rendered_np - target_np).mean(axis=2)
-            cv2.imwrite(str(root / "renders/error" / f"{stem}.png"), (error * 255).clip(0, 255).astype(np.uint8))
-            rows.append({
-                "frame_index": int(view.index),
-                "psnr": quality["psnr"],
-                "ssim": quality["ssim"],
-                "lpips": quality["lpips"],
-                "depth_mae_m": depth_mae,
-                "depth_valid_pixels": int(depth_valid.sum()),
-                "depth_target_pixels": int((target_depth > 0).sum()),
-                "alpha_mean": float(alpha.mean()),
-                "alpha_supported_pixels": int((alpha > 0.01).sum()),
-            })
+        for split, views in (("train", train_views), ("test", test_views)):
+            split_root = root / split
+            for name in ("renders/rgb", "renders/target", "renders/depth", "renders/alpha", "renders/error", "arrays"):
+                (split_root / name).mkdir(parents=True, exist_ok=True)
+            for view in views:
+                output = model.render(view.camera)
+                rendered_rgb = output.rgb.clamp(0, 1)
+                target_rgb = torch.from_numpy(view.rgb).permute(2, 0, 1).to(model.means3d.device)
+                rendered_depth = output.depth.squeeze()
+                target_depth = torch.from_numpy(view.depth_m).to(model.means3d.device)
+                alpha = (1.0 - output.final_transmittance.squeeze()).clamp(0, 1)
+                quality = image_metrics(
+                    rendered_rgb.permute(1, 2, 0),
+                    target_rgb.permute(1, 2, 0),
+                )
+                depth_valid = (target_depth > 0) & (rendered_depth > 0) & torch.isfinite(rendered_depth)
+                depth_mae = float((rendered_depth[depth_valid] - target_depth[depth_valid]).abs().mean()) if bool(depth_valid.any()) else None
+                stem = f"{int(view.index):06d}"
+                rendered_np = rendered_rgb.permute(1, 2, 0).cpu().numpy()
+                target_np = target_rgb.permute(1, 2, 0).cpu().numpy()
+                _write_rgb(split_root / "renders/rgb" / f"{stem}.png", rendered_np)
+                _write_rgb(split_root / "renders/target" / f"{stem}.png", target_np)
+                rendered_depth_np = rendered_depth.cpu().numpy().astype(np.float32)
+                target_depth_np = target_depth.cpu().numpy().astype(np.float32)
+                alpha_np = alpha.cpu().numpy().astype(np.float32)
+                np.save(split_root / "arrays" / f"{stem}_rendered_depth.npy", rendered_depth_np)
+                np.save(split_root / "arrays" / f"{stem}_target_depth.npy", target_depth_np)
+                np.save(split_root / "arrays" / f"{stem}_alpha.npy", alpha_np)
+                _write_depth(split_root / "renders/depth" / f"{stem}.png", rendered_depth_np)
+                _write_depth(split_root / "renders/depth" / f"{stem}_target.png", target_depth_np)
+                cv2.imwrite(str(split_root / "renders/alpha" / f"{stem}.png"), (alpha_np * 255).clip(0, 255).astype(np.uint8))
+                error = np.abs(rendered_np - target_np).mean(axis=2)
+                cv2.imwrite(str(split_root / "renders/error" / f"{stem}.png"), (error * 255).clip(0, 255).astype(np.uint8))
+                rows_by_split[split].append({
+                    "frame_index": int(view.index),
+                    "psnr": quality["psnr"],
+                    "ssim": quality["ssim"],
+                    "lpips": quality["lpips"],
+                    "depth_mae_m": depth_mae,
+                    "depth_valid_pixels": int(depth_valid.sum()),
+                    "depth_target_pixels": int((target_depth > 0).sum()),
+                    "alpha_mean": float(alpha.mean()),
+                    "alpha_supported_pixels": int((alpha > 0.01).sum()),
+                })
     _write_gaussian_artifacts(model, root / "map")
     metrics = {
         "schema_version": EVALUATION_SCHEMA,
-        "evaluation_protocol": SAGE_METRIC_SCHEMA,
-        "frame_selection": "retained_keyframes",
+        "evaluation_protocol": "experimental_local_metrics",
+        "frame_selection": "all_accepted_frames_split_by_keyframe",
         "gaussian_count": model.count,
-        "keyframes": rows,
-        "aggregate": _aggregate(rows),
+        "train_views": rows_by_split["train"],
+        "test_views": rows_by_split["test"],
+        "aggregate": {split: _aggregate(rows) for split, rows in rows_by_split.items()},
         "metric_identity": image_metrics.identity,
     }
     (root / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")

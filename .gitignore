@@ -11,3 +11,4 @@ __pycache__/
 *.pt
 *.pth
 outputs/
+config/*.local.yaml

@@ -4,7 +4,6 @@ import bisect
 import re
 import sqlite3
 import struct
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -19,10 +18,11 @@ from .rasterizer import LicCamera
 IMAGE_TOPIC = "/odin1/image/compressed"
 ODOMETRY_TOPIC = "/odin1/odometry"
 SLAM_CLOUD_TOPIC = "/odin1/cloud_slam"
+DEPTH_ADAPTER_SINGLE_CLOUD_ZBUFFER = "single_cloud_zbuffer"
 SOURCE_INVALID = np.uint8(255)
-SOURCE_SPNET = np.uint8(2)  # SAGE SourceType.SPNET_BLIND
-SOURCE_CENTER = np.uint8(3)  # SAGE SourceType.LIDAR_SLAM_CENTER
-SOURCE_FUSED5 = np.uint8(4)  # SAGE SourceType.LIDAR_SLAM_FUSED5
+SOURCE_SPNET = np.uint8(2)
+SOURCE_CENTER = np.uint8(3)
+SOURCE_FUSED5 = np.uint8(4)  # Retained for checkpoint compatibility.
 _POINTFIELD_DTYPES = {
     1: np.int8,
     2: np.uint8,
@@ -190,6 +190,7 @@ class _SourceSlot:
     rgb: np.ndarray
     world_from_camera: np.ndarray
     points_world: np.ndarray
+    point_colors: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -419,6 +420,17 @@ class PoseTrack:
         pose[:3, 3] = (1 - alpha) * self._poses[left][:3, 3] + alpha * self._poses[right][:3, 3]
         return pose
 
+    def nearest(self, timestamp_ns: int, *, max_dt_ns: int) -> np.ndarray:
+        """Return one recorded pose inside LIC's strict synchronization window."""
+        index = bisect.bisect_left(self._timestamps, int(timestamp_ns))
+        candidates = self._timestamps[max(0, index - 1) : min(len(self._timestamps), index + 1)]
+        if not candidates:
+            raise PoseSyncError("Image timestamp has no recorded odometry sample")
+        selected_timestamp = min(candidates, key=lambda value: abs(value - timestamp_ns))
+        if abs(selected_timestamp - timestamp_ns) > max_dt_ns:
+            raise PoseSyncError("Image timestamp has no synchronized odometry sample")
+        return self._poses[self._timestamps.index(selected_timestamp)].copy()
+
 
 def _matrix_to_quaternion(matrix: np.ndarray) -> np.ndarray:
     trace = float(np.trace(matrix))
@@ -506,11 +518,11 @@ def _fishpoly_maps(width: int, height: int, a11: float, a12: float, a22: float, 
     return (a11 * x * scale + a12 * y * scale + u0).astype(np.float32), (a22 * y * scale + v0).astype(np.float32)
 
 
-def _lic2_output_geometry(
+def _output_geometry(
     calibration: Calibration,
     output_size: tuple[int, int],
 ) -> tuple[CameraIntrinsics, tuple[int, int, int, int]]:
-    """Reproduce LIC2's center-crop, resize, and intrinsic calculation."""
+    """Apply the configured center crop/resize and update intrinsics."""
 
     width, height = output_size
     source_width = calibration.intrinsics.width
@@ -548,29 +560,40 @@ def _bag_shards(root: Path) -> tuple[Path, ...]:
 
 
 class RosbagReader:
-    """Read fixed-pose Odin frames with LIC/SAGE centered-five fusion."""
+    """Read fixed-pose Odin frames using a single synchronized SLAM cloud.
+
+    The reference Gaussian-LIC executable receives a depth image from its
+    upstream ROS frontend.  Odin ROS2 bags do not contain that topic, so this
+    reader explicitly uses the approved experimental adapter: the matched
+    ``/odin1/cloud_slam`` cloud is z-buffer projected into the matched image.
+    It never mixes points from neighbouring frames.
+    """
 
     def __init__(
         self,
         rosbag_dir: Path,
         calibration_path: Path,
         *,
-        max_sync_dt_ms: float = 50.0,
-        max_cloud_dt_ms: float = 20.0,
+        max_sync_dt_ms: float = 10.0,
+        max_cloud_dt_ms: float = 10.0,
         resize: tuple[int, int] | None = None,
+        depth_adapter: str = DEPTH_ADAPTER_SINGLE_CLOUD_ZBUFFER,
     ) -> None:
         if max_sync_dt_ms <= 0 or max_cloud_dt_ms <= 0:
             raise ValueError("max_sync_dt_ms and max_cloud_dt_ms must be positive")
         if resize is not None and (len(resize) != 2 or resize[0] < 1 or resize[1] < 1):
             raise ValueError("resize must contain positive width and height")
+        if depth_adapter != DEPTH_ADAPTER_SINGLE_CLOUD_ZBUFFER:
+            raise ValueError(f"Unsupported experimental depth adapter: {depth_adapter}")
         self.root = Path(rosbag_dir).resolve()
         self.calibration = parse_calibration(Path(calibration_path).resolve())
         output_size = resize or (
             self.calibration.intrinsics.width,
             self.calibration.intrinsics.height,
         )
-        self.intrinsics, self._crop = _lic2_output_geometry(self.calibration, output_size)
+        self.intrinsics, self._crop = _output_geometry(self.calibration, output_size)
         self._resize = resize
+        self._depth_adapter = depth_adapter
         self._images: list[_Message] = []
         self._clouds: list[_Message] = []
         poses: list[tuple[int, np.ndarray]] = []
@@ -623,11 +646,21 @@ class RosbagReader:
 
     @property
     def rejected_source_frames(self) -> int:
-        """Number of source slots rejected for missing or unsynchronized clouds."""
+        """Number of source frames rejected for missing or unsynchronized clouds."""
         return self._rejected_source_frames
 
+    @property
+    def input_adapter(self) -> dict[str, object]:
+        return {
+            "depth": self._depth_adapter,
+            "depth_alignment": "experimental_adapter",
+            "sync_window_ms": self._max_sync_dt_ns / 1_000_000,
+            "cloud_window_ms": self._max_cloud_dt_ns / 1_000_000,
+            "neighboring_frame_fusion": False,
+        }
+
     def frames(self, *, start: int = 0, limit: int | None = None) -> Iterator[BagFrame]:
-        """Stream accepted centered-five frames without materializing the bag."""
+        """Stream accepted single-frame mapping observations."""
         return self.iter_frames(start=start, limit=limit)
 
     def iter_frames(self, *, start: int = 0, limit: int | None = None) -> Iterator[BagFrame]:
@@ -635,7 +668,6 @@ class RosbagReader:
             raise ValueError("start must be non-negative and limit must be positive")
         self._skipped_pose_frames = 0
         self._rejected_source_frames = 0
-        window: deque[_SourceSlot | _RejectedSlot] = deque(maxlen=5)
         emitted = 0
         for index, image in enumerate(self._images[start:], start=start):
             slot = self._build_source_slot(index, image)
@@ -644,12 +676,8 @@ class RosbagReader:
                     self._skipped_pose_frames += 1
                 else:
                     self._rejected_source_frames += 1
-            window.append(slot)
-            if len(window) < window.maxlen:
                 continue
-            if any(isinstance(item, _RejectedSlot) for item in window):
-                continue
-            yield self._build_fused_frame(tuple(window))
+            yield self._build_frame(slot)
             emitted += 1
             if limit is not None and emitted >= limit:
                 return
@@ -680,7 +708,7 @@ class RosbagReader:
             rgb = cv2.resize(rgb, self._resize, interpolation=cv2.INTER_LINEAR).astype(np.float32)
         rgb = np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
         try:
-            world_from_base = self._poses.interpolate(timestamp, max_dt_ns=self._max_sync_dt_ns)
+            world_from_base = self._poses.nearest(timestamp, max_dt_ns=self._max_sync_dt_ns)
         except PoseSyncError:
             return _RejectedSlot(index, timestamp, "pose")
         world_from_camera = world_from_base @ self._lidar_from_camera
@@ -692,94 +720,54 @@ class RosbagReader:
         if abs(cloud.timestamp_ns - timestamp) > self._max_cloud_dt_ns:
             return _RejectedSlot(index, timestamp, "cloud")
         cloud_message = _parse_pointcloud(self._message_data(cloud))
-        points, _cloud_colors = _decode_cloud(cloud_message)
-        return _SourceSlot(index, timestamp, rgb, world_from_camera, points)
+        points, colors = _decode_cloud(cloud_message)
+        if colors is None:
+            return _RejectedSlot(index, timestamp, "cloud")
+        return _SourceSlot(index, timestamp, rgb, world_from_camera, points, colors)
 
-    def _build_fused_frame(self, slots: tuple[_SourceSlot, ...]) -> BagFrame:
-        target = slots[2]
-        center_depth, fused5_depth = _CenteredFiveProjector(self.intrinsics).project(slots)
-
-        center_valid = center_depth > 0
-        source_types = np.full(center_depth.shape, SOURCE_INVALID, dtype=np.uint8)
-        source_types[center_valid] = SOURCE_CENTER
-        fused_valid = fused5_depth > 0
-        source_types[~center_valid & fused_valid] = SOURCE_FUSED5
-        source_confidences = np.zeros(center_depth.shape, dtype=np.float32)
-        source_confidences[center_valid] = 1.0
-        source_confidences[~center_valid & fused_valid] = 0.7
-        mapping_depth = np.where(center_valid, center_depth, fused5_depth).astype(np.float32)
-        points, colors, point_depths, point_types, point_confidences = _backproject_depth(
-            mapping_depth,
-            target.rgb,
-            target.world_from_camera,
+    def _build_frame(self, slot: _SourceSlot) -> BagFrame:
+        depth, visible_indices = _project_visible_cloud(
+            slot.points_world,
+            slot.world_from_camera,
             self.intrinsics,
-            source_types,
-            source_confidences,
+            min_depth=0.1,
+            max_depth=200.0,
         )
+        visible_points = slot.points_world[visible_indices]
+        visible_colors = slot.point_colors[visible_indices]
+        source_types = np.where(depth > 0, SOURCE_CENTER, SOURCE_INVALID).astype(np.uint8)
+        source_confidences = (depth > 0).astype(np.float32)
         return BagFrame(
-            target.index,
-            target.timestamp_ns,
-            target.rgb,
-            mapping_depth,
+            slot.index,
+            slot.timestamp_ns,
+            slot.rgb,
+            depth,
             self.intrinsics,
-            target.world_from_camera,
-            points,
-            colors,
-            point_depths_m=point_depths,
-            center_depth_m=center_depth,
-            fused5_depth_m=fused5_depth,
+            slot.world_from_camera,
+            visible_points,
+            visible_colors,
+            center_depth_m=depth,
             source_types=source_types,
             source_confidences=source_confidences,
-            point_source_types=point_types,
-            point_source_confidences=point_confidences,
+            point_source_types=np.full(len(visible_points), SOURCE_CENTER, dtype=np.uint8),
+            point_source_confidences=np.ones(len(visible_points), dtype=np.float32),
         )
 
 
-class _CenteredFiveProjector:
-    """Deterministic t-2..t+2 z-buffer fusion used by the source-frame adapter."""
-
-    def __init__(self, intrinsics: CameraIntrinsics, *, min_depth: float = 0.1, max_depth: float = 200.0, conflict_threshold: float = 1.0) -> None:
-        self.intrinsics = intrinsics
-        self.min_depth = min_depth
-        self.max_depth = max_depth
-        self.conflict_threshold = conflict_threshold
-
-    def project(self, slots: tuple[_SourceSlot, ...]) -> tuple[np.ndarray, np.ndarray]:
-        if len(slots) != 5:
-            raise ValueError("Centered-five fusion requires exactly five source slots")
-        depths = np.stack(
-            [
-                _project_depth(
-                    slot.points_world,
-                    slots[2].world_from_camera,
-                    self.intrinsics,
-                    min_depth=self.min_depth,
-                    max_depth=self.max_depth,
-                )
-                for slot in slots
-            ],
-            axis=0,
-        )
-        valid = depths > 0
-        valid_count = valid.sum(axis=0)
-        minimum = np.min(np.where(valid, depths, np.inf), axis=0)
-        maximum = np.max(np.where(valid, depths, -np.inf), axis=0)
-        fused = np.where(valid_count > 0, minimum, 0).astype(np.float32)
-        conflicts = (valid_count > 1) & ((maximum - minimum) > self.conflict_threshold)
-        fused[conflicts] = 0
-        center_valid = depths[2] > 0
-        fused[center_valid] = depths[2][center_valid]
-        return depths[2], fused
-
-
-def _project_depth(
+def _project_visible_cloud(
     points_world: np.ndarray,
     world_from_camera: np.ndarray,
     intrinsics: CameraIntrinsics,
     *,
     min_depth: float,
     max_depth: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Z-buffer a cloud and return exactly the visible point/color rows.
+
+    The returned indices select one nearest source point for each non-zero
+    depth pixel, so map initialization and depth supervision share one data
+    contract. Ties are broken by original cloud row for deterministic replay.
+    """
     camera_from_world = np.linalg.inv(world_from_camera)
     points_h = np.concatenate((points_world.astype(np.float64), np.ones((len(points_world), 1))), axis=1)
     camera = (camera_from_world @ points_h.T).T[:, :3]
@@ -801,31 +789,34 @@ def _project_depth(
         & (cols >= 0)
         & (cols < intrinsics.width)
     )
-    rows, cols, projected_z = rows[inside], cols[inside], z[valid][inside]
-    zbuffer = np.full((intrinsics.height, intrinsics.width), np.inf, dtype=np.float32)
-    np.minimum.at(zbuffer, (rows, cols), projected_z.astype(np.float32))
-    return np.where(np.isfinite(zbuffer), zbuffer, 0).astype(np.float32)
+    source_indices = np.flatnonzero(valid)[inside]
+    rows, cols, projected_z = rows[inside], cols[inside], z[valid][inside].astype(np.float32)
+    if len(source_indices) == 0:
+        return np.zeros((intrinsics.height, intrinsics.width), dtype=np.float32), source_indices
+    pixel_indices = rows * intrinsics.width + cols
+    order = np.lexsort((source_indices, projected_z))
+    sorted_pixels = pixel_indices[order]
+    first_per_pixel = np.r_[True, sorted_pixels[1:] != sorted_pixels[:-1]]
+    winners = order[first_per_pixel]
+    zbuffer = np.zeros((intrinsics.height, intrinsics.width), dtype=np.float32)
+    zbuffer[rows[winners], cols[winners]] = projected_z[winners]
+    return zbuffer, source_indices[winners]
 
 
-def _backproject_depth(
-    depth: np.ndarray,
-    rgb: np.ndarray,
+def _project_depth(
+    points_world: np.ndarray,
     world_from_camera: np.ndarray,
     intrinsics: CameraIntrinsics,
-    source_types: np.ndarray,
-    source_confidences: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    rows, cols = np.nonzero(depth > 0)
-    z = depth[rows, cols].astype(np.float64)
-    x = (cols.astype(np.float64) - intrinsics.cx) * z / intrinsics.fx
-    y = (rows.astype(np.float64) - intrinsics.cy) * z / intrinsics.fy
-    camera_h = np.column_stack((x, y, z, np.ones_like(z)))
-    world = (world_from_camera.astype(np.float64) @ camera_h.T).T[:, :3]
-    colors = rgb[rows, cols]
-    return (
-        world.astype(np.float32),
-        colors.astype(np.float32),
-        z.astype(np.float32),
-        source_types[rows, cols].astype(np.uint8),
-        source_confidences[rows, cols].astype(np.float32),
+    *,
+    min_depth: float,
+    max_depth: float,
+) -> np.ndarray:
+    """Compatibility helper returning only the z-buffer depth image."""
+    depth, _ = _project_visible_cloud(
+        points_world,
+        world_from_camera,
+        intrinsics,
+        min_depth=min_depth,
+        max_depth=max_depth,
     )
+    return depth

@@ -1,0 +1,24 @@
+name: licmap
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - cuda-nvcc=12.1
+  - cuda-cudart=12.1
+  - cuda-cudart-dev=12.1
+  - cuda-cccl=12.1
+  - gxx_linux-64=11.4.0
+  - glm
+  - numpy=2.2.6
+  - pillow=12.2.0
+  - pyyaml=6.0.3
+  - pip
+  - pip:
+      - torch @ https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp310-cp310-linux_x86_64.whl
+      - torchvision @ https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp310-cp310-linux_x86_64.whl
+      - pytest==9.1.1
+      - torchmetrics==1.9.0
+      - plyfile==1.1.4
+      - opencv-python==5.0.0.93

@@ -35,9 +35,15 @@ are rejected, and valid center depth is restored with center priority.
 The resulting mapping depth uses the center source wherever available and the
 centered-five source only to fill center holes. Its source type and confidence
 (`1.0` for center, `0.7` for fused-five) are retained through Gaussian
-initialization and append. Gaussians use `z / focal` with the configured
-`(0.95, 1.05, 1.20)` scale anisotropy, opacity `0.5` by default, identity
-rotation, and append-only first-wins 5 cm `floor` voxel deduplication:
+initialization and append. The LIC2 lifecycle is reproduced: all accepted
+frames accumulate source points, only every eighth frame is a keyframe, the
+first keyframe initializes the map, later keyframes extend it after current-view
+pixel/depth deduplication and rendered-alpha `< 0.99` gating, and opacity
+pruning runs every five keyframes at threshold `0.01`.
+
+Gaussians use degree-3 SH, isotropic `2 * z / focal` scale, opacity `0.1`,
+identity rotation, and the requested outer first-wins 5 cm `floor` voxel
+deduplication:
 
 ```bash
 python -m lic_mapping.trainer \
@@ -50,15 +56,16 @@ python -m lic_mapping.trainer \
 
 Images without an interpolable odometry pose, such as the startup gap in
 some bags, remain rejected slots rather than being compressed out of the
-five-slot window. The CLI reports pose and source-slot rejection counts in its
-JSON output and records them in the checkpoint report; image, point-cloud, and
-calibration decode errors remain hard failures.
+five-slot window. `RosbagReader.frames()` is a generator: image/cloud payloads
+are loaded from SQLite rows on demand, and the trainer retains only the current
+accumulation plus keyframe cameras. The CLI reports pose and source-slot
+rejection counts in its JSON output and records them in the checkpoint report;
+image, point-cloud, and calibration decode errors remain hard failures.
 
-This is intentionally a minimal backend baseline. It does not yet implement
-the SPNet prior, rendered growth gates, pruning policy, or formal artifact
-receipts. The centered-five contract is taken from the workspace SAGE data
-path; the literal LIC2 C++ reference itself uses cumulative point-cloud
-extension rather than a centered-five window.
+This remains a backend baseline: SPNet depth completion, exposure optimization,
+and final visual-quality artifact generation are outside this Python adapter.
+The centered-five contract is taken from the workspace SAGE data path, while
+the map lifecycle follows the LIC2 reference.
 
 The public Python interface is deliberately small:
 

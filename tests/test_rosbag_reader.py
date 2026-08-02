@@ -134,7 +134,11 @@ def test_rosbag_reader_builds_fixed_pose_frame(tmp_path: Path) -> None:
         connection.commit()
 
     reader = RosbagReader(bag, bag / "cam_in_ex.txt", max_sync_dt_ms=100.0)
-    frames = reader.frames(limit=1)
+    assert reader._images[0].data is None
+    assert reader._clouds[0].data is None
+    stream = reader.frames(limit=1)
+    assert not isinstance(stream, list)
+    frames = list(stream)
 
     assert len(frames) == 1
     assert reader.skipped_pose_frames == 1

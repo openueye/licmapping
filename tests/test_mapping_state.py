@@ -41,13 +41,13 @@ def test_gaussian_append_preserves_adam_state() -> None:
     model = GaussianMap.from_frame(initial, device="cpu", voxel_size=0.05)
     assert model.source_types.shape == (3,)
     assert torch.all(model.source_types == int(SOURCE_CENTER))
-    assert torch.allclose(model.scales / model.scales[:, :1], torch.tensor([1.0, 1.05 / 0.95, 1.20 / 0.95]))
+    assert torch.allclose(model.scales, model.scales[:, :1])
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     (sum(parameter.square().mean() for parameter in model.parameters())).backward()
     optimizer.step()
 
     next_frame = _frame(1, np.asarray([[0, 0, 2], [0.4, 0, 2], [0, 0.4, 2]], dtype=np.float32))
-    added = model.append_frame(next_frame, optimizer=optimizer)
+    added = model.append_frame(next_frame, optimizer=optimizer, alpha_gate=False)
 
     assert added == 2
     assert model.count == 5
@@ -57,6 +57,20 @@ def test_gaussian_append_preserves_adam_state() -> None:
     optimizer.zero_grad(set_to_none=True)
     sum(parameter.square().mean() for parameter in model.parameters()).backward()
     optimizer.step()
+
+
+def test_gaussian_prune_migrates_rows_and_keeps_rasterizer_floor() -> None:
+    frame = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
+    model = GaussianMap.from_frame(frame, device="cpu")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model.opacity_logits.data.fill_(-10.0)
+    model.opacity_logits.data[:2] = 10.0
+
+    removed = model.prune_low_opacity(optimizer=optimizer, threshold=0.5)
+
+    assert removed == 1
+    assert model.count == 2
+    assert all(group["params"][0] is getattr(model, name) for group, name in zip(optimizer.param_groups, model.PARAMETER_NAMES))
 
 
 def test_decode_uint32_rgb_field() -> None:

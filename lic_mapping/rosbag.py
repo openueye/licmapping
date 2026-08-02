@@ -7,6 +7,7 @@ import struct
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -55,6 +56,7 @@ class BagFrame:
     world_from_camera: np.ndarray
     points_world: np.ndarray
     point_colors: np.ndarray
+    point_depths_m: np.ndarray | None = None
     center_depth_m: np.ndarray | None = None
     fused5_depth_m: np.ndarray | None = None
     source_types: np.ndarray | None = None
@@ -68,6 +70,16 @@ class BagFrame:
         depth = np.asarray(self.depth_m)
         points = np.asarray(self.points_world)
         colors = np.asarray(self.point_colors)
+        pose = np.asarray(self.world_from_camera, dtype=np.float64)
+        if pose.shape != (4, 4) or not np.isfinite(pose).all():
+            raise ValueError("BagFrame.world_from_camera must be a finite 4x4 matrix")
+        if not np.allclose(pose[3], [0, 0, 0, 1], atol=1e-6):
+            raise ValueError("BagFrame.world_from_camera must be homogeneous")
+        if self.point_depths_m is None:
+            points_h = np.concatenate((points.astype(np.float64), np.ones((len(points), 1))), axis=1)
+            point_depths = (np.linalg.inv(pose) @ points_h.T).T[:, 2].astype(np.float32)
+        else:
+            point_depths = np.asarray(self.point_depths_m)
         center_depth = depth.copy() if self.center_depth_m is None else np.asarray(self.center_depth_m)
         fused5_depth = np.zeros_like(depth) if self.fused5_depth_m is None else np.asarray(self.fused5_depth_m)
         source_types = (
@@ -92,6 +104,7 @@ class BagFrame:
         )
         object.__setattr__(self, "center_depth_m", center_depth)
         object.__setattr__(self, "fused5_depth_m", fused5_depth)
+        object.__setattr__(self, "point_depths_m", point_depths)
         object.__setattr__(self, "source_types", source_types)
         object.__setattr__(self, "source_confidences", source_confidences)
         object.__setattr__(self, "point_source_types", point_source_types)
@@ -117,6 +130,8 @@ class BagFrame:
             raise ValueError("BagFrame.points_world must be float32 Nx3")
         if colors.shape != (len(points), 3) or colors.dtype != np.float32:
             raise ValueError("BagFrame.point_colors must be float32 Nx3")
+        if point_depths.shape != (len(points),) or point_depths.dtype != np.float32:
+            raise ValueError("BagFrame.point_depths_m must be float32 N")
         if not np.isfinite(rgb).all() or ((rgb < 0) | (rgb > 1)).any():
             raise ValueError("BagFrame.rgb must be finite and within [0, 1]")
         if not np.isfinite(depth).all() or (depth < 0).any():
@@ -134,11 +149,8 @@ class BagFrame:
             raise ValueError("BagFrame source depth data must be finite and non-negative")
         if not np.isfinite(points).all() or not np.isfinite(colors).all():
             raise ValueError("BagFrame point data must be finite")
-        pose = np.asarray(self.world_from_camera, dtype=np.float64)
-        if pose.shape != (4, 4) or not np.isfinite(pose).all():
-            raise ValueError("BagFrame.world_from_camera must be a finite 4x4 matrix")
-        if not np.allclose(pose[3], [0, 0, 0, 1], atol=1e-6):
-            raise ValueError("BagFrame.world_from_camera must be homogeneous")
+        if not np.isfinite(point_depths).all() or (point_depths < 0).any():
+            raise ValueError("BagFrame.point_depths_m must be finite and non-negative")
 
     def lic_camera(self) -> LicCamera:
         return LicCamera(
@@ -165,7 +177,9 @@ class Calibration:
 @dataclass(frozen=True)
 class _Message:
     timestamp_ns: int
-    data: bytes
+    shard: Path | None = None
+    row_id: int | None = None
+    data: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +243,13 @@ def _header(data: bytes) -> tuple[int, str, int]:
     nsec, offset = _u32(data, offset)
     frame_id, offset = _string(data, offset)
     return sec * 1_000_000_000 + nsec, frame_id, offset
+
+
+def _timestamp_from_prefix(data: bytes) -> int:
+    if len(data) != 8:
+        raise ValueError("ROS message timestamp prefix must contain 8 bytes")
+    sec, nsec = struct.unpack_from("<iI", data, 0)
+    return sec * 1_000_000_000 + nsec
 
 
 def _parse_image(data: bytes) -> tuple[int, str, bytes]:
@@ -537,15 +558,21 @@ class RosbagReader:
                     expected = {IMAGE_TOPIC: "sensor_msgs/msg/CompressedImage", ODOMETRY_TOPIC: "nav_msgs/msg/Odometry", SLAM_CLOUD_TOPIC: "sensor_msgs/msg/PointCloud2"}[topic]
                     if message_type != expected or serialization != "cdr":
                         raise ValueError(f"Unexpected topic identity for {topic}")
-                    for row_id, payload in connection.execute("SELECT rowid, data FROM messages WHERE topic_id = ? ORDER BY rowid", (topic_id,)):
-                        data = bytes(payload)
-                        timestamp = _header(data)[0]
-                        message = _Message(timestamp, data)
+                    query = (
+                        "SELECT rowid, data FROM messages WHERE topic_id = ? ORDER BY rowid"
+                        if topic == ODOMETRY_TOPIC
+                        else "SELECT rowid, substr(data, 5, 8) FROM messages WHERE topic_id = ? ORDER BY rowid"
+                    )
+                    for row_id, payload in connection.execute(query, (topic_id,)):
                         if topic == IMAGE_TOPIC:
-                            self._images.append(message)
+                            timestamp = _timestamp_from_prefix(bytes(payload))
+                            self._images.append(_Message(timestamp, shard=shard, row_id=int(row_id)))
                         elif topic == SLAM_CLOUD_TOPIC:
-                            self._clouds.append(message)
+                            timestamp = _timestamp_from_prefix(bytes(payload))
+                            self._clouds.append(_Message(timestamp, shard=shard, row_id=int(row_id)))
                         else:
+                            data = bytes(payload)
+                            timestamp = _header(data)[0]
                             _stamp, _frame, _child, pose = _parse_odometry(data)
                             poses.append((timestamp, pose))
         if not self._images or not self._clouds:
@@ -573,13 +600,17 @@ class RosbagReader:
         """Number of source slots rejected for missing or unsynchronized clouds."""
         return self._rejected_source_frames
 
-    def frames(self, *, start: int = 0, limit: int | None = None) -> list[BagFrame]:
+    def frames(self, *, start: int = 0, limit: int | None = None) -> Iterator[BagFrame]:
+        """Stream accepted centered-five frames without materializing the bag."""
+        return self.iter_frames(start=start, limit=limit)
+
+    def iter_frames(self, *, start: int = 0, limit: int | None = None) -> Iterator[BagFrame]:
         if start < 0 or (limit is not None and limit < 1):
             raise ValueError("start must be non-negative and limit must be positive")
         self._skipped_pose_frames = 0
         self._rejected_source_frames = 0
-        result = []
         window: deque[_SourceSlot | _RejectedSlot] = deque(maxlen=5)
+        emitted = 0
         for index, image in enumerate(self._images[start:], start=start):
             slot = self._build_source_slot(index, image)
             if isinstance(slot, _RejectedSlot):
@@ -592,13 +623,25 @@ class RosbagReader:
                 continue
             if any(isinstance(item, _RejectedSlot) for item in window):
                 continue
-            result.append(self._build_fused_frame(tuple(window)))
-            if limit is not None and len(result) >= limit:
-                break
-        return result
+            yield self._build_fused_frame(tuple(window))
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                return
+
+    @staticmethod
+    def _message_data(message: _Message) -> bytes:
+        if message.data is not None:
+            return message.data
+        if message.shard is None or message.row_id is None:
+            raise ValueError("Message has no backing ROSBAG row")
+        with sqlite3.connect(str(message.shard)) as connection:
+            row = connection.execute("SELECT data FROM messages WHERE rowid = ?", (message.row_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"ROSBAG message row disappeared: {message.shard}:{message.row_id}")
+        return bytes(row[0])
 
     def _build_source_slot(self, index: int, image: _Message) -> _SourceSlot | _RejectedSlot:
-        timestamp, _frame_id, compressed = _parse_image(image.data)
+        timestamp, _frame_id, compressed = _parse_image(self._message_data(image))
         bgr = cv2.imdecode(np.frombuffer(compressed, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             raise ValueError(f"Could not decode image {index}")
@@ -607,6 +650,7 @@ class RosbagReader:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         if self._resize is not None:
             rgb = cv2.resize(rgb, self._resize, interpolation=cv2.INTER_AREA).astype(np.float32)
+        rgb = np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
         try:
             world_from_base = self._poses.interpolate(timestamp, max_dt_ns=self._max_sync_dt_ns)
         except PoseSyncError:
@@ -619,7 +663,7 @@ class RosbagReader:
         cloud = min(candidates, key=lambda item: abs(item.timestamp_ns - timestamp))
         if abs(cloud.timestamp_ns - timestamp) > self._max_cloud_dt_ns:
             return _RejectedSlot(index, timestamp, "cloud")
-        cloud_message = _parse_pointcloud(cloud.data)
+        cloud_message = _parse_pointcloud(self._message_data(cloud))
         points, _cloud_colors = _decode_cloud(cloud_message)
         return _SourceSlot(index, timestamp, rgb, world_from_camera, points)
 
@@ -636,7 +680,7 @@ class RosbagReader:
         source_confidences[center_valid] = 1.0
         source_confidences[~center_valid & fused_valid] = 0.7
         mapping_depth = np.where(center_valid, center_depth, fused5_depth).astype(np.float32)
-        points, colors, point_types, point_confidences = _backproject_depth(
+        points, colors, point_depths, point_types, point_confidences = _backproject_depth(
             mapping_depth,
             target.rgb,
             target.world_from_camera,
@@ -653,6 +697,7 @@ class RosbagReader:
             target.world_from_camera,
             points,
             colors,
+            point_depths_m=point_depths,
             center_depth_m=center_depth,
             fused5_depth_m=fused5_depth,
             source_types=source_types,
@@ -741,7 +786,7 @@ def _backproject_depth(
     intrinsics: CameraIntrinsics,
     source_types: np.ndarray,
     source_confidences: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rows, cols = np.nonzero(depth > 0)
     z = depth[rows, cols].astype(np.float64)
     x = (cols.astype(np.float64) - intrinsics.cx) * z / intrinsics.fx
@@ -752,6 +797,7 @@ def _backproject_depth(
     return (
         world.astype(np.float32),
         colors.astype(np.float32),
+        z.astype(np.float32),
         source_types[rows, cols].astype(np.uint8),
         source_confidences[rows, cols].astype(np.float32),
     )

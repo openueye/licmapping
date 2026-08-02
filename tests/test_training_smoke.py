@@ -40,6 +40,7 @@ def test_fixed_pose_training_loop_accumulates_and_updates() -> None:
     trainer = LICMappingTrainer(
         TrainingConfig(
             iterations_per_frame=1,
+            keyframe_every=1,
             replay_keyframes=0,
             max_initial_points=16,
             max_new_points_per_frame=16,

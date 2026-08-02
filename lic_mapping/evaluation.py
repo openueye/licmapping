@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+import hashlib
+import importlib
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
+import warnings
 
 import cv2
 import numpy as np
@@ -13,6 +18,168 @@ from .gaussians import GaussianMap
 
 
 EVALUATION_SCHEMA = "lic2-final-evaluation-v1"
+SAGE_METRIC_SCHEMA = "sage-image-metrics-v1"
+TORCHMETRICS_VERSION = "1.9.0"
+TORCHVISION_VERSION_PREFIX = "0.20.1"
+LPIPS_CALIBRATION_SHA256 = "df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0"
+LPIPS_BACKBONE_SHA256 = "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02"
+LPIPS_MODEL_ID = "alexnet-imagenet"
+_LPIPS_BUILD_LOCK = Lock()
+warnings.filterwarnings("ignore", category=FutureWarning, message=r".*weights_only=False.*")
+
+
+def default_lpips_backbone_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "SAGE-models" / "alexnet-owt-7be5be79.pth"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _force_torch_load_weights_only():
+    original_torch_load = torch.load
+
+    def load_with_weights_only(*args, **kwargs):
+        kwargs.setdefault("weights_only", True)
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = load_with_weights_only
+    try:
+        yield
+    finally:
+        torch.load = original_torch_load
+
+
+class SAGEImageMetricEvaluator:
+    """Compute SAGE's offline AlexNet LPIPS, PSNR, and Gaussian-window SSIM."""
+
+    def __init__(self, device: torch.device, *, backbone: Path | None = None) -> None:
+        self.device = torch.device(device)
+        path = Path(backbone or default_lpips_backbone_path()).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"SAGE LPIPS AlexNet weights do not exist: {path}")
+        actual = _sha256_file(path)
+        if actual != LPIPS_BACKBONE_SHA256:
+            raise ValueError(
+                "SAGE LPIPS AlexNet weights SHA-256 mismatch: "
+                f"expected {LPIPS_BACKBONE_SHA256}, got {actual} at {path}"
+            )
+        calibration, torchmetrics_version, calibration_package = _lpips_calibration_path()
+        try:
+            import torchvision
+        except ImportError as exc:
+            raise RuntimeError("SAGE LPIPS evaluation requires torchvision") from exc
+        torchvision_version = str(torchvision.__version__)
+        if not torchvision_version.startswith(TORCHVISION_VERSION_PREFIX):
+            raise ValueError(
+                f"SAGE image metrics require torchvision {TORCHVISION_VERSION_PREFIX}.*, got {torchvision_version}"
+            )
+        self.identity = {
+            "kind": "repository-offline",
+            "model_id": LPIPS_MODEL_ID,
+            "weights_sha256": actual,
+            "evaluator_schema": SAGE_METRIC_SCHEMA,
+            "torchmetrics_version": torchmetrics_version,
+            "torchvision_version": torchvision_version,
+            "calibration_sha256": LPIPS_CALIBRATION_SHA256,
+            "calibration_package": calibration_package,
+            "device": str(self.device),
+            "dtype": "float32",
+        }
+        del calibration
+        self.lpips = _build_lpips(_load_alexnet_features(path)).to(self.device)
+
+    @torch.inference_mode()
+    def __call__(self, rendered: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+        if rendered.shape != target.shape or rendered.ndim != 3 or rendered.shape[-1] != 3:
+            raise ValueError("RGB tensors must share HxWx3 shape")
+        rendered = rendered.to(self.device, dtype=torch.float32).clamp(0, 1)
+        target = target.to(self.device, dtype=torch.float32).clamp(0, 1)
+        mse = F.mse_loss(rendered, target)
+        _, _, ssim = _sage_photometric_loss(rendered, target)
+        lpips = self.lpips(
+            rendered.permute(2, 0, 1).unsqueeze(0),
+            target.permute(2, 0, 1).unsqueeze(0),
+        )
+        return {
+            "psnr": float(-10 * torch.log10(mse.clamp_min(1e-12))),
+            "ssim": float(ssim),
+            "lpips": float(torch.as_tensor(lpips).mean()),
+        }
+
+
+def _lpips_calibration_path() -> tuple[Path, str, str]:
+    torchmetrics = importlib.import_module("torchmetrics")
+    version = str(torchmetrics.__version__)
+    if version != TORCHMETRICS_VERSION:
+        raise ValueError(f"SAGE image metrics require torchmetrics=={TORCHMETRICS_VERSION}, got {version}")
+    package_path = Path(torchmetrics.__file__).resolve().parent
+    calibration = package_path / "functional" / "image" / "lpips_models" / "alex.pth"
+    if not calibration.is_file() or _sha256_file(calibration) != LPIPS_CALIBRATION_SHA256:
+        raise ValueError(f"TorchMetrics LPIPS Alex calibration is missing or mismatched: {calibration}")
+    return calibration, version, f"torchmetrics=={version}:functional/image/lpips_models/alex.pth"
+
+
+def _load_alexnet_features(path: Path) -> torch.nn.Sequential:
+    try:
+        import torchvision
+
+        model = torchvision.models.alexnet(weights=None)
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError("AlexNet checkpoint must contain a state dictionary")
+        model.load_state_dict(state, strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"SAGE AlexNet backbone is structurally incompatible: {path}") from exc
+    return model.features
+
+
+def _build_lpips(features: torch.nn.Sequential) -> torch.nn.Module:
+    lpips_module = importlib.import_module("torchmetrics.functional.image.lpips")
+    metric_type = getattr(importlib.import_module("torchmetrics.image.lpip"), "LearnedPerceptualImagePatchSimilarity")
+    original_resolver = lpips_module._get_tv_model_features
+
+    def explicit_features(net: str, pretrained: bool = False) -> torch.nn.Sequential:
+        if net != "alexnet" or not pretrained:
+            raise ValueError(f"SAGE LPIPS only supports the local pretrained AlexNet, got {net}")
+        return features
+
+    with _LPIPS_BUILD_LOCK:
+        lpips_module._get_tv_model_features = explicit_features
+        try:
+            with _force_torch_load_weights_only():
+                return metric_type(net_type="alex", normalize=True).eval().requires_grad_(False)
+        finally:
+            lpips_module._get_tv_model_features = original_resolver
+
+
+def _sage_photometric_loss(
+    rendered: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    ssim_weight: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = rendered.permute(2, 0, 1).unsqueeze(0)
+    y = target.permute(2, 0, 1).unsqueeze(0)
+    coordinates = torch.arange(11, dtype=x.dtype, device=x.device) - 5
+    gaussian = torch.exp(-(coordinates.square()) / (2 * 1.5**2))
+    gaussian = gaussian / gaussian.sum()
+    window = torch.outer(gaussian, gaussian).view(1, 1, 11, 11).expand(3, 1, 11, 11).contiguous()
+    mu_x = F.conv2d(x, window, padding=5, groups=3)
+    mu_y = F.conv2d(y, window, padding=5, groups=3)
+    sigma_x = F.conv2d(x * x, window, padding=5, groups=3) - mu_x.square()
+    sigma_y = F.conv2d(y * y, window, padding=5, groups=3) - mu_y.square()
+    sigma_xy = F.conv2d(x * y, window, padding=5, groups=3) - mu_x * mu_y
+    ssim = (((2 * mu_x * mu_y + 0.01**2) * (2 * sigma_xy + 0.03**2)) /
+            ((mu_x.square() + mu_y.square() + 0.01**2) * (sigma_x + sigma_y + 0.03**2))).mean()
+    l1 = F.l1_loss(rendered, target)
+    image = (1 - ssim_weight) * l1 + ssim_weight * (1 - ssim.clamp(-1, 1))
+    return image, l1, ssim
 
 
 def evaluate_final_map(
@@ -20,7 +187,7 @@ def evaluate_final_map(
     keyframes: Iterable[object],
     output_dir: Path,
     *,
-    lpips_model: Path | None = None,
+    lpips_backbone: Path | None = None,
 ) -> dict[str, object]:
     """Write LIC2-compatible final metrics and inspection artifacts.
 
@@ -32,23 +199,25 @@ def evaluate_final_map(
     root = Path(output_dir)
     for name in ("renders/rgb", "renders/target", "renders/depth", "renders/alpha", "renders/error", "arrays"):
         (root / name).mkdir(parents=True, exist_ok=True)
-    lpips = _load_lpips(lpips_model, model.means3d.device) if lpips_model is not None else None
+    image_metrics = SAGEImageMetricEvaluator(model.means3d.device, backbone=lpips_backbone)
     rows: list[dict[str, object]] = []
     with torch.inference_mode():
         for view in keyframes:
             output = model.render(view.camera)
-            rendered_rgb = model.correct_exposure(output.rgb).clamp(0, 1)
+            rendered_rgb = output.rgb.clamp(0, 1)
             target_rgb = torch.from_numpy(view.rgb).permute(2, 0, 1).to(model.means3d.device)
             rendered_depth = output.depth.squeeze()
             target_depth = torch.from_numpy(view.depth_m).to(model.means3d.device)
             alpha = (1.0 - output.final_transmittance.squeeze()).clamp(0, 1)
-            rgb_mse = F.mse_loss(rendered_rgb, target_rgb)
+            quality = image_metrics(
+                rendered_rgb.permute(1, 2, 0),
+                target_rgb.permute(1, 2, 0),
+            )
             depth_valid = (target_depth > 0) & (rendered_depth > 0) & torch.isfinite(rendered_depth)
             if bool(depth_valid.any()):
                 depth_mae = float((rendered_depth[depth_valid] - target_depth[depth_valid]).abs().mean())
             else:
                 depth_mae = None
-            frame_lpips = _compute_lpips(lpips, rendered_rgb, target_rgb) if lpips is not None else None
             stem = f"{int(view.index):06d}"
             rendered_np = rendered_rgb.permute(1, 2, 0).cpu().numpy()
             target_np = target_rgb.permute(1, 2, 0).cpu().numpy()
@@ -67,9 +236,9 @@ def evaluate_final_map(
             cv2.imwrite(str(root / "renders/error" / f"{stem}.png"), (error * 255).clip(0, 255).astype(np.uint8))
             rows.append({
                 "frame_index": int(view.index),
-                "psnr": _psnr(float(rgb_mse)),
-                "ssim": float(_ssim(rendered_rgb, target_rgb)),
-                "lpips": frame_lpips,
+                "psnr": quality["psnr"],
+                "ssim": quality["ssim"],
+                "lpips": quality["lpips"],
                 "depth_mae_m": depth_mae,
                 "depth_valid_pixels": int(depth_valid.sum()),
                 "depth_target_pixels": int((target_depth > 0).sum()),
@@ -79,15 +248,12 @@ def evaluate_final_map(
     _write_gaussian_artifacts(model, root / "map")
     metrics = {
         "schema_version": EVALUATION_SCHEMA,
+        "evaluation_protocol": SAGE_METRIC_SCHEMA,
+        "frame_selection": "retained_keyframes",
         "gaussian_count": model.count,
-        "exposure": model.exposure.detach().cpu().tolist(),
         "keyframes": rows,
         "aggregate": _aggregate(rows),
-        "lpips": {
-            "requested": lpips_model is not None,
-            "available": lpips is not None,
-            "model": str(lpips_model) if lpips_model is not None else None,
-        },
+        "metric_identity": image_metrics.identity,
     }
     (root / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
@@ -103,46 +269,6 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
     result["depth_valid_pixels"] = int(sum(int(row["depth_valid_pixels"]) for row in rows))
     result["depth_target_pixels"] = int(sum(int(row["depth_target_pixels"]) for row in rows))
     return result
-
-
-def _psnr(mse: float) -> float:
-    return float(-10.0 * np.log10(max(mse, 1e-12)))
-
-
-def _ssim(rendered: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    rendered = rendered.unsqueeze(0)
-    target = target.unsqueeze(0)
-    mu_rendered = F.avg_pool2d(rendered, 3, stride=1, padding=1)
-    mu_target = F.avg_pool2d(target, 3, stride=1, padding=1)
-    sigma_rendered = F.avg_pool2d(rendered * rendered, 3, stride=1, padding=1) - mu_rendered.square()
-    sigma_target = F.avg_pool2d(target * target, 3, stride=1, padding=1) - mu_target.square()
-    sigma_cross = F.avg_pool2d(rendered * target, 3, stride=1, padding=1) - mu_rendered * mu_target
-    c1, c2 = 0.01**2, 0.03**2
-    score = ((2 * mu_rendered * mu_target + c1) * (2 * sigma_cross + c2)) / (
-        (mu_rendered.square() + mu_target.square() + c1)
-        * (sigma_rendered + sigma_target + c2)
-    )
-    return score.clamp(0, 1).mean()
-
-
-def _load_lpips(path: Path, device: torch.device) -> torch.jit.ScriptModule:
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"LPIPS TorchScript model does not exist: {source}")
-    try:
-        return torch.jit.load(str(source), map_location=device).eval()
-    except Exception as exc:
-        raise RuntimeError(f"Cannot load LIC2 LPIPS model: {source}") from exc
-
-
-def _compute_lpips(model: torch.jit.ScriptModule, rendered: torch.Tensor, target: torch.Tensor) -> float:
-    try:
-        value = model(rendered.unsqueeze(0), target.unsqueeze(0))
-    except Exception:
-        value = model([rendered.unsqueeze(0), target.unsqueeze(0)])
-    if isinstance(value, (tuple, list)):
-        value = value[0]
-    return float(torch.as_tensor(value).mean())
 
 
 def _write_rgb(path: Path, rgb: np.ndarray) -> None:
@@ -204,4 +330,4 @@ def _write_ply(path: Path, means: np.ndarray, colors: np.ndarray, opacity: np.nd
         vertices.tofile(stream)
 
 
-__all__ = ["EVALUATION_SCHEMA", "evaluate_final_map"]
+__all__ = ["EVALUATION_SCHEMA", "SAGEImageMetricEvaluator", "default_lpips_backbone_path", "evaluate_final_map"]

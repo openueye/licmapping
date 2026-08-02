@@ -126,13 +126,8 @@ def test_spnet_completion_matches_lic2_patch_selection() -> None:
     assert np.allclose(result.points_world[:, 2], 2.0)
 
 
-def test_exposure_is_identity_then_affine() -> None:
+def test_gaussian_state_has_no_exposure_parameter() -> None:
     frame = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
     model = GaussianMap.from_frame(frame, device="cpu")
-    rgb = torch.ones((3, 2, 2), dtype=torch.float32)
-    assert torch.allclose(model.correct_exposure(rgb), rgb)
-
-    model.exposure.data[0] = torch.tensor([2.0, 0.0, 0.0, 0.1])
-    corrected = model.correct_exposure(rgb)
-    assert torch.allclose(corrected[0], torch.full((2, 2), 2.1))
-    assert torch.allclose(corrected[1:], rgb[1:])
+    assert "exposure" not in dict(model.named_parameters())
+    assert "exposure" not in model.state_dict()

@@ -47,8 +47,6 @@ class TrainingConfig:
     depth_completion_patch_size: int = 10
     depth_completion_max_depth_m: float = 20.0
     depth_completion_confidence: float = 0.4
-    optimize_exposure: bool = True
-    exposure_learning_rate: float = 1.0e-3
 
     def __post_init__(self) -> None:
         if self.iterations_per_frame < 1 or self.keyframe_every < 1 or self.replay_keyframes < 0:
@@ -75,8 +73,6 @@ class TrainingConfig:
             raise ValueError("depth completion settings must be positive")
         if not 0 <= self.depth_completion_confidence <= 1:
             raise ValueError("depth_completion_confidence must be within [0, 1]")
-        if self.exposure_learning_rate <= 0:
-            raise ValueError("exposure_learning_rate must be positive")
         if not 0 <= self.lambda_dssim <= 1:
             raise ValueError("lambda_dssim must be within [0, 1]")
         rates = (
@@ -222,7 +218,6 @@ class LICMappingTrainer:
                     scale_anisotropy=self.config.scale_anisotropy,
                     scale_multiplier=self.config.scale_multiplier,
                     sh_degree=self.config.sh_degree,
-                    apply_exposure=self.config.optimize_exposure,
                     voxel_size=self.config.voxel_size,
                 )
                 optimizer = self._optimizer(model)
@@ -271,6 +266,20 @@ class LICMappingTrainer:
             del accumulated
         if model is None or optimizer is None:
             raise ValueError("No keyframe was available for Gaussian initialization")
+        spnet_identity = None
+        if self.depth_completer is not None:
+            spnet_identity = {
+                name: str(getattr(self.depth_completer, name))
+                for name in (
+                    "model_id",
+                    "source_id",
+                    "source_commit",
+                    "source_tree_sha256",
+                    "weights_path",
+                    "weights_sha256",
+                )
+                if hasattr(self.depth_completer, name)
+            }
         report = {
             "frames": accepted_frames,
             "keyframes": keyframe_count,
@@ -279,12 +288,10 @@ class LICMappingTrainer:
             "history": records,
             "pose_optimization": "disabled",
             "renderer": "lic_mapping._C",
-            "exposure": {
-                "optimized": self.config.optimize_exposure,
-                "learning_rate": self.config.exposure_learning_rate,
-            },
             "depth_completion": {
                 "enabled": self.config.depth_completion,
+                "backend": type(self.depth_completer).__name__ if self.depth_completer is not None else None,
+                "identity": spnet_identity,
                 "patch_size": self.config.depth_completion_patch_size,
                 "max_depth_m": self.config.depth_completion_max_depth_m,
                 "keyframes": self.last_depth_completion,
@@ -301,7 +308,6 @@ class LICMappingTrainer:
             {"params": [model.opacity_logits], "lr": self.config.learning_rate_opacity},
             {"params": [model.log_scales], "lr": self.config.learning_rate_scales},
             {"params": [model.rotations], "lr": self.config.learning_rate_rotations},
-            *([{"params": [model.exposure], "lr": self.config.exposure_learning_rate}] if self.config.optimize_exposure else []),
         ], eps=1e-15)
 
     def _optimize_keyframe(self, model: GaussianMap, optimizer: torch.optim.Optimizer, keyframes: list[_KeyframeView]) -> dict[str, object]:
@@ -327,7 +333,7 @@ class LICMappingTrainer:
             optimizer.zero_grad(set_to_none=True)
             output = model.render(frame.camera)
             target_rgb = torch.from_numpy(frame.rgb).permute(2, 0, 1).contiguous().to(self.device)
-            rendered_rgb = model.correct_exposure(output.rgb)
+            rendered_rgb = output.rgb
             rgb_loss = F.l1_loss(rendered_rgb, target_rgb)
             photo_loss = (1.0 - self.config.lambda_dssim) * rgb_loss + self.config.lambda_dssim * (1.0 - _ssim(rendered_rgb, target_rgb))
             target_depth = torch.from_numpy(frame.depth_m).to(self.device)
@@ -427,18 +433,20 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spnet-torchscript", type=Path, default=None)
     parser.add_argument("--spnet-patch-size", type=int, default=10)
     parser.add_argument("--spnet-max-depth", type=float, default=20.0)
-    parser.add_argument("--no-exposure", action="store_true")
+    parser.add_argument("--spnet-weights", type=Path, default=None)
+    parser.add_argument("--spnet-source", type=Path, default=None)
     parser.add_argument("--artifact-dir", type=Path, default=None)
     parser.add_argument("--no-artifacts", action="store_true")
-    parser.add_argument("--lpips-model", type=Path, default=None)
+    parser.add_argument("--lpips-backbone", type=Path, default=None)
     parser.add_argument("--resize-width", type=int, default=None)
     parser.add_argument("--resize-height", type=int, default=None)
     args = parser.parse_args(argv)
     if (args.resize_width is None) != (args.resize_height is None):
         parser.error("--resize-width and --resize-height must be provided together")
     resize = None if args.resize_width is None else (args.resize_width, args.resize_height)
-    if args.spnet_engine is not None and args.spnet_torchscript is not None:
-        parser.error("--spnet-engine and --spnet-torchscript are mutually exclusive")
+    backends = [args.spnet_engine, args.spnet_torchscript, args.spnet_weights]
+    if sum(value is not None for value in backends) > 1:
+        parser.error("--spnet-engine, --spnet-torchscript, and --spnet-weights are mutually exclusive")
     reader = RosbagReader(args.rosbag, args.calibration, resize=resize)
     frames = reader.frames(limit=args.frame_limit)
     config = TrainingConfig(
@@ -448,10 +456,9 @@ def _main(argv: list[str] | None = None) -> int:
         max_gaussians=args.max_gaussians,
         prune_every_n_keyframes=args.prune_every,
         prune_opacity_threshold=args.prune_opacity,
-        depth_completion=args.spnet_engine is not None or args.spnet_torchscript is not None,
+        depth_completion=any(value is not None for value in backends),
         depth_completion_patch_size=args.spnet_patch_size,
         depth_completion_max_depth_m=args.spnet_max_depth,
-        optimize_exposure=not args.no_exposure,
     )
     completer = None
     if args.spnet_engine is not None:
@@ -462,6 +469,13 @@ def _main(argv: list[str] | None = None) -> int:
     elif args.spnet_torchscript is not None:
         from .spnet import TorchScriptDepthCompleter
         completer = TorchScriptDepthCompleter(args.spnet_torchscript, device=args.device)
+    elif args.spnet_weights is not None:
+        from .spnet import SPNetDepthCompleter
+        completer = SPNetDepthCompleter(
+            args.spnet_weights,
+            source_root=args.spnet_source,
+            device=args.device,
+        )
     trainer = LICMappingTrainer(config, device=args.device, depth_completer=completer)
     model, report = trainer.fit(frames)
     report["skipped_pose_frames"] = reader.skipped_pose_frames
@@ -470,7 +484,12 @@ def _main(argv: list[str] | None = None) -> int:
     artifact_dir = args.artifact_dir or args.output.with_name(f"{args.output.stem}_artifacts")
     if not args.no_artifacts:
         from .evaluation import evaluate_final_map
-        evaluation = evaluate_final_map(model, trainer.last_keyframes, artifact_dir, lpips_model=args.lpips_model)
+        evaluation = evaluate_final_map(
+            model,
+            trainer.last_keyframes,
+            artifact_dir,
+            lpips_backbone=args.lpips_backbone,
+        )
         report["evaluation"] = {
             "artifact_dir": str(artifact_dir),
             "aggregate": evaluation["aggregate"],

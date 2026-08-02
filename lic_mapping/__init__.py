@@ -11,6 +11,7 @@ from .rosbag import (
 )
 from .spnet import (
     CallableDepthCompleter,
+    SPNetDepthCompleter,
     TensorRTDepthCompleter,
     TorchScriptDepthCompleter,
     complete_keyframe_points,
@@ -29,6 +30,7 @@ __all__ = [
     "SOURCE_INVALID",
     "SOURCE_SPNET",
     "CallableDepthCompleter",
+    "SPNetDepthCompleter",
     "TensorRTDepthCompleter",
     "TorchScriptDepthCompleter",
     "complete_keyframe_points",

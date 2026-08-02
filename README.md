@@ -69,14 +69,21 @@ python -m lic_mapping.trainer \
 SPNet is invoked only on keyframes. Its metric output follows LIC2's
 `depth / 200` input scale and is converted into sparse blind-region points by
 the native 10-pixel patch selection, known-point bias check, Sobel edge gate,
-and 20 m depth limit. A TorchScript export can be used with
-`--spnet-torchscript`; the two backends are mutually exclusive. Supplying no
-model leaves completion disabled and is recorded as such in the report.
+and 20 m depth limit. The SAGE Large-CNX checkpoint can be loaded directly:
 
-Exposure optimization is enabled by default. It trains LIC2's identity-
-initialized 3x4 affine exposure matrix with learning rate `0.001`, stores the
-matrix in the checkpoint, and applies it before the photometric loss. Use
-`--no-exposure` for the uncorrected baseline.
+```bash
+python -m lic_mapping.trainer \
+  --rosbag /path/to/odin-bag \
+  --calibration /path/to/cam_in_ex.txt \
+  --output outputs/lic_mapping/checkpoint.pt \
+  --spnet-weights 00_Baselines/SAGE-models/Large_300.pth
+```
+
+The loader verifies the locked SPNet source tree and checkpoint SHA-256 before
+loading the `{"network": state_dict}` payload. A TensorRT engine or TorchScript
+export remains available through `--spnet-engine` or `--spnet-torchscript`; the
+three backends are mutually exclusive. Supplying no model leaves completion
+disabled and is recorded as such in the report.
 
 Images without an interpolable odometry pose, such as the startup gap in
 some bags, remain rejected slots rather than being compressed out of the
@@ -89,13 +96,17 @@ image, point-cloud, and calibration decode errors remain hard failures.
 At the end of a CLI run, `<output-stem>_artifacts/` contains `metrics.json`
 (per-keyframe and aggregate PSNR/SSIM/depth/alpha metrics), rendered and target
 RGB PNGs, depth arrays/colour maps, alpha and absolute-error maps, and
-`map/gaussians.npz` plus a binary `point_cloud.ply`. LPIPS is computed when a
-compatible TorchScript model is supplied with `--lpips-model`; otherwise the
-artifact explicitly records that LPIPS was not requested.
+`map/gaussians.npz` plus a binary `point_cloud.ply`. The retained-keyframe
+metrics use SAGE's offline AlexNet LPIPS, PSNR, and Gaussian-window SSIM
+protocol. The AlexNet checkpoint is loaded from
+`00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth` by default and can be
+overridden with `--lpips-backbone`.
 
 The centered-five contract is taken from the workspace SAGE data path, while
-the map lifecycle, SPNet selection, exposure parameter, and final evaluation
-layout follow the LIC2 reference.
+the map lifecycle, SPNet selection, and final evaluation layout follow the
+LIC2 reference. Exposure optimization is intentionally absent: the native
+LIC2 renderer does not apply its unused exposure argument, so the Python
+adapter keeps RGB loss and checkpoints free of an exposure parameter.
 
 The public Python interface is deliberately small:
 

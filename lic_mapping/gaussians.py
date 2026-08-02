@@ -28,8 +28,6 @@ class GaussianMap(nn.Module):
         *,
         sh_rest: torch.Tensor | None = None,
         sh_degree: int = 3,
-        exposure: torch.Tensor | None = None,
-        apply_exposure: bool = True,
         voxel_size: float = 0.05,
         source_types: torch.Tensor | None = None,
         source_confidences: torch.Tensor | None = None,
@@ -50,18 +48,6 @@ class GaussianMap(nn.Module):
         if sh_rest.shape != (count, expected_sh, 3):
             raise ValueError("sh_rest shape is inconsistent with sh_degree")
         self.sh_rest = nn.Parameter(sh_rest)
-        if exposure is None:
-            exposure = torch.cat(
-                (
-                    torch.eye(3, dtype=torch.float32, device=means3d.device),
-                    torch.zeros((3, 1), dtype=torch.float32, device=means3d.device),
-                ),
-                dim=1,
-            )
-        if exposure.shape != (3, 4):
-            raise ValueError("exposure must have shape [3, 4]")
-        self.exposure = nn.Parameter(exposure)
-        self.apply_exposure = bool(apply_exposure)
         if source_types is None:
             source_types = torch.full((count,), int(SOURCE_CENTER), dtype=torch.uint8, device=means3d.device)
         if source_confidences is None:
@@ -85,7 +71,6 @@ class GaussianMap(nn.Module):
         scale_anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0),
         scale_multiplier: float = 2.0,
         sh_degree: int = 3,
-        apply_exposure: bool = True,
         voxel_size: float = 0.05,
     ) -> "GaussianMap":
         if not 0.0 < initial_opacity < 1.0:
@@ -118,7 +103,6 @@ class GaussianMap(nn.Module):
             torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=target).repeat(len(points), 1),
             sh_rest=torch.zeros((len(points), (sh_degree + 1) ** 2 - 1, 3), dtype=torch.float32, device=target),
             sh_degree=sh_degree,
-            apply_exposure=apply_exposure,
             voxel_size=voxel_size,
             source_types=torch.from_numpy(frame.point_source_types).to(target),
             source_confidences=torch.from_numpy(frame.point_source_confidences).to(target),
@@ -154,16 +138,6 @@ class GaussianMap(nn.Module):
             sh_degree=self.sh_degree,
             debug=debug,
         )
-
-    def correct_exposure(self, rgb: torch.Tensor) -> torch.Tensor:
-        """Apply LIC2's trainable 3x4 affine exposure transform to [3,H,W]."""
-        if rgb.ndim != 3 or rgb.shape[0] != 3:
-            raise ValueError("RGB tensor must have shape [3, H, W]")
-        if not self.apply_exposure:
-            return rgb
-        identity = torch.eye(3, dtype=self.exposure.dtype, device=self.exposure.device)
-        residual = self.exposure[:, :3] - identity
-        return rgb + torch.einsum("ij,jhw->ihw", residual, rgb) + self.exposure[:, 3, None, None]
 
     def append_frame(
         self,
@@ -399,8 +373,6 @@ class GaussianMap(nn.Module):
             raise ValueError("GaussianMap source_types shape or dtype is invalid")
         if self.source_confidences.shape != (count,) or self.source_confidences.dtype != torch.float32:
             raise ValueError("GaussianMap source_confidences shape or dtype is invalid")
-        if self.exposure.shape != (3, 4):
-            raise ValueError("GaussianMap exposure shape is invalid")
         if not all(torch.isfinite(parameter).all() for parameter in self.parameters()):
             raise ValueError("GaussianMap parameters must be finite")
         if not torch.isfinite(self.source_confidences).all() or (self.source_confidences < 0).any():

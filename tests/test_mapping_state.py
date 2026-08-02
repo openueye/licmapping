@@ -5,6 +5,7 @@ import torch
 
 from lic_mapping.gaussians import GaussianMap
 from lic_mapping.rosbag import BagFrame, CameraIntrinsics, PoseTrack, SOURCE_CENTER, _decode_cloud
+from lic_mapping.spnet import CallableDepthCompleter, complete_keyframe_points
 
 
 def _frame(index: int, points: np.ndarray) -> BagFrame:
@@ -95,3 +96,43 @@ def test_decode_uint32_rgb_field() -> None:
     })
     assert points.shape == (2, 3)
     assert np.allclose(colors[0], np.asarray([0x12, 0x34, 0x56]) / 255.0)
+
+
+def test_spnet_completion_matches_lic2_patch_selection() -> None:
+    frame = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
+    center = np.zeros((8, 8), dtype=np.float32)
+    center[0, 0] = 2.0
+    frame = BagFrame(
+        frame.index,
+        frame.timestamp_ns,
+        frame.rgb,
+        frame.depth_m,
+        frame.intrinsics,
+        frame.world_from_camera,
+        frame.points_world,
+        frame.point_colors,
+        center_depth_m=center,
+    )
+    completer = CallableDepthCompleter(
+        lambda _rgb, depth, _mask: torch.full_like(depth, 2.0 / 200.0),
+        device="cpu",
+    )
+
+    result = complete_keyframe_points(frame, completer, patch_size=4, max_depth_m=20.0)
+
+    assert result.candidate_count == 3
+    assert result.points_world.shape == (3, 3)
+    assert np.allclose(result.depths_m, 2.0)
+    assert np.allclose(result.points_world[:, 2], 2.0)
+
+
+def test_exposure_is_identity_then_affine() -> None:
+    frame = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
+    model = GaussianMap.from_frame(frame, device="cpu")
+    rgb = torch.ones((3, 2, 2), dtype=torch.float32)
+    assert torch.allclose(model.correct_exposure(rgb), rgb)
+
+    model.exposure.data[0] = torch.tensor([2.0, 0.0, 0.0, 0.1])
+    corrected = model.correct_exposure(rgb)
+    assert torch.allclose(corrected[0], torch.full((2, 2), 2.1))
+    assert torch.allclose(corrected[1:], rgb[1:])

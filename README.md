@@ -54,6 +54,30 @@ python -m lic_mapping.trainer \
   --iterations 30
 ```
 
+Enable the native LIC2 SPNet completion path by supplying the matching
+TensorRT engine (the engine resolution must equal the resized image):
+
+```bash
+python -m lic_mapping.trainer \
+  --rosbag /path/to/odin-bag \
+  --calibration /path/to/cam_in_ex.txt \
+  --output outputs/lic_mapping/checkpoint.pt \
+  --resize-width 800 --resize-height 648 \
+  --spnet-engine /path/to/spnet_800_648.engine
+```
+
+SPNet is invoked only on keyframes. Its metric output follows LIC2's
+`depth / 200` input scale and is converted into sparse blind-region points by
+the native 10-pixel patch selection, known-point bias check, Sobel edge gate,
+and 20 m depth limit. A TorchScript export can be used with
+`--spnet-torchscript`; the two backends are mutually exclusive. Supplying no
+model leaves completion disabled and is recorded as such in the report.
+
+Exposure optimization is enabled by default. It trains LIC2's identity-
+initialized 3x4 affine exposure matrix with learning rate `0.001`, stores the
+matrix in the checkpoint, and applies it before the photometric loss. Use
+`--no-exposure` for the uncorrected baseline.
+
 Images without an interpolable odometry pose, such as the startup gap in
 some bags, remain rejected slots rather than being compressed out of the
 five-slot window. `RosbagReader.frames()` is a generator: image/cloud payloads
@@ -62,10 +86,16 @@ accumulation plus keyframe cameras. The CLI reports pose and source-slot
 rejection counts in its JSON output and records them in the checkpoint report;
 image, point-cloud, and calibration decode errors remain hard failures.
 
-This remains a backend baseline: SPNet depth completion, exposure optimization,
-and final visual-quality artifact generation are outside this Python adapter.
+At the end of a CLI run, `<output-stem>_artifacts/` contains `metrics.json`
+(per-keyframe and aggregate PSNR/SSIM/depth/alpha metrics), rendered and target
+RGB PNGs, depth arrays/colour maps, alpha and absolute-error maps, and
+`map/gaussians.npz` plus a binary `point_cloud.ply`. LPIPS is computed when a
+compatible TorchScript model is supplied with `--lpips-model`; otherwise the
+artifact explicitly records that LPIPS was not requested.
+
 The centered-five contract is taken from the workspace SAGE data path, while
-the map lifecycle follows the LIC2 reference.
+the map lifecycle, SPNet selection, exposure parameter, and final evaluation
+layout follow the LIC2 reference.
 
 The public Python interface is deliberately small:
 
@@ -82,10 +112,6 @@ output = render(
 `output.rgb` is `[3, H, W]`, `output.depth` is `[H, W]`, `output.radii` is
 `[N]`, and `output.visible` is `output.radii > 0`. The returned tensors remain
 connected to PyTorch autograd through the reference CUDA backward path.
-
-This first slice only validates the rasterizer seam. LIC point-cloud
-accumulation, Gaussian initialization/extension, loss scheduling, sparse Adam,
-and ROSBAG frame loading remain intentionally outside this module.
 
 The upstream `duplicateWithKeys` kernel has a one-row edge case: do not call
 this adapter with fewer than two Gaussian rows. A normal scene is far above

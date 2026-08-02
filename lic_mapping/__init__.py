@@ -7,7 +7,15 @@ from .rosbag import (
     SOURCE_CENTER,
     SOURCE_FUSED5,
     SOURCE_INVALID,
+    SOURCE_SPNET,
 )
+from .spnet import (
+    CallableDepthCompleter,
+    TensorRTDepthCompleter,
+    TorchScriptDepthCompleter,
+    complete_keyframe_points,
+)
+from .evaluation import evaluate_final_map
 
 __all__ = [
     "BagFrame",
@@ -19,5 +27,11 @@ __all__ = [
     "SOURCE_CENTER",
     "SOURCE_FUSED5",
     "SOURCE_INVALID",
+    "SOURCE_SPNET",
+    "CallableDepthCompleter",
+    "TensorRTDepthCompleter",
+    "TorchScriptDepthCompleter",
+    "complete_keyframe_points",
+    "evaluate_final_map",
     "render",
 ]

@@ -12,7 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from .gaussians import GaussianMap
-from .rosbag import BagFrame, RosbagReader
+from .rosbag import BagFrame, RosbagReader, SOURCE_SPNET
+from .spnet import DepthCompleter, complete_keyframe_points
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,12 @@ class TrainingConfig:
     optimize_depth: bool = True
     depth_weight: float = 0.005
     iteration_decay: bool = True
+    depth_completion: bool = False
+    depth_completion_patch_size: int = 10
+    depth_completion_max_depth_m: float = 20.0
+    depth_completion_confidence: float = 0.4
+    optimize_exposure: bool = True
+    exposure_learning_rate: float = 1.0e-3
 
     def __post_init__(self) -> None:
         if self.iterations_per_frame < 1 or self.keyframe_every < 1 or self.replay_keyframes < 0:
@@ -64,6 +71,12 @@ class TrainingConfig:
             raise ValueError("max_gaussians must be at least two")
         if self.prune_every_n_keyframes < 0 or self.prune_opacity_threshold < 0:
             raise ValueError("pruning settings are invalid")
+        if self.depth_completion_patch_size < 1 or self.depth_completion_max_depth_m <= 0:
+            raise ValueError("depth completion settings must be positive")
+        if not 0 <= self.depth_completion_confidence <= 1:
+            raise ValueError("depth_completion_confidence must be within [0, 1]")
+        if self.exposure_learning_rate <= 0:
+            raise ValueError("exposure_learning_rate must be positive")
         if not 0 <= self.lambda_dssim <= 1:
             raise ValueError("lambda_dssim must be within [0, 1]")
         rates = (
@@ -124,6 +137,15 @@ class _PointAccumulator:
         self.source_types.clear()
         self.source_confidences.clear()
 
+    def add_completed(self, points: np.ndarray, colors: np.ndarray, depths: np.ndarray, *, confidence: float) -> None:
+        if not len(points):
+            return
+        self.points.append(np.asarray(points, dtype=np.float32))
+        self.colors.append(np.asarray(colors, dtype=np.float32))
+        self.depths.append(np.asarray(depths, dtype=np.float32))
+        self.source_types.append(np.full(len(points), int(SOURCE_SPNET), dtype=np.uint8))
+        self.source_confidences.append(np.full(len(points), confidence, dtype=np.float32))
+
 
 @dataclass(frozen=True)
 class _KeyframeView:
@@ -137,13 +159,18 @@ class _KeyframeView:
 class LICMappingTrainer:
     """Sequential fixed-pose mapper using the LIC rasterizer as its renderer."""
 
-    def __init__(self, config: TrainingConfig, *, device: torch.device | str = "cuda") -> None:
+    def __init__(self, config: TrainingConfig, *, device: torch.device | str = "cuda", depth_completer: DepthCompleter | None = None) -> None:
         self.config = config
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("LICMappingTrainer requires a CUDA device")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable")
+        if config.depth_completion and depth_completer is None:
+            raise ValueError("depth_completion=True requires a DepthCompleter")
+        self.depth_completer = depth_completer
+        self.last_keyframes: list[_KeyframeView] = []
+        self.last_depth_completion: list[dict[str, object]] = []
 
     def fit(self, frames: Iterable[BagFrame]) -> tuple[GaussianMap, dict[str, object]]:
         torch.manual_seed(0)
@@ -161,6 +188,27 @@ class LICMappingTrainer:
             accumulator.add(frame)
             if accepted_frames % self.config.keyframe_every != 0:
                 continue
+            completion_record: dict[str, object] = {"enabled": self.config.depth_completion, "added": 0}
+            if self.config.depth_completion:
+                assert self.depth_completer is not None
+                completion = complete_keyframe_points(
+                    frame,
+                    self.depth_completer,
+                    patch_size=self.config.depth_completion_patch_size,
+                    max_depth_m=self.config.depth_completion_max_depth_m,
+                )
+                accumulator.add_completed(
+                    completion.points_world,
+                    completion.colors,
+                    completion.depths_m,
+                    confidence=self.config.depth_completion_confidence,
+                )
+                completion_record.update({
+                    "added": int(len(completion.points_world)),
+                    "candidate_count": completion.candidate_count,
+                    "mean_known_bias_m": completion.mean_known_bias_m,
+                })
+                self.last_depth_completion.append({"frame_index": frame.index, **completion_record})
             accumulated = accumulator.frame(frame)
             added = 0
             clear_accumulator = True
@@ -174,6 +222,7 @@ class LICMappingTrainer:
                     scale_anisotropy=self.config.scale_anisotropy,
                     scale_multiplier=self.config.scale_multiplier,
                     sh_degree=self.config.sh_degree,
+                    apply_exposure=self.config.optimize_exposure,
                     voxel_size=self.config.voxel_size,
                 )
                 optimizer = self._optimizer(model)
@@ -214,6 +263,7 @@ class LICMappingTrainer:
                 "gaussian_count": model.count,
                 "added": added,
                 "pruned": pruned,
+                "depth_completion": completion_record,
             })
             records.append(loss_record)
             if clear_accumulator:
@@ -229,7 +279,18 @@ class LICMappingTrainer:
             "history": records,
             "pose_optimization": "disabled",
             "renderer": "lic_mapping._C",
+            "exposure": {
+                "optimized": self.config.optimize_exposure,
+                "learning_rate": self.config.exposure_learning_rate,
+            },
+            "depth_completion": {
+                "enabled": self.config.depth_completion,
+                "patch_size": self.config.depth_completion_patch_size,
+                "max_depth_m": self.config.depth_completion_max_depth_m,
+                "keyframes": self.last_depth_completion,
+            },
         }
+        self.last_keyframes = keyframes
         return model, report
 
     def _optimizer(self, model: GaussianMap) -> torch.optim.Optimizer:
@@ -240,6 +301,7 @@ class LICMappingTrainer:
             {"params": [model.opacity_logits], "lr": self.config.learning_rate_opacity},
             {"params": [model.log_scales], "lr": self.config.learning_rate_scales},
             {"params": [model.rotations], "lr": self.config.learning_rate_rotations},
+            *([{"params": [model.exposure], "lr": self.config.exposure_learning_rate}] if self.config.optimize_exposure else []),
         ], eps=1e-15)
 
     def _optimize_keyframe(self, model: GaussianMap, optimizer: torch.optim.Optimizer, keyframes: list[_KeyframeView]) -> dict[str, object]:
@@ -265,8 +327,9 @@ class LICMappingTrainer:
             optimizer.zero_grad(set_to_none=True)
             output = model.render(frame.camera)
             target_rgb = torch.from_numpy(frame.rgb).permute(2, 0, 1).contiguous().to(self.device)
-            rgb_loss = F.l1_loss(output.rgb, target_rgb)
-            photo_loss = (1.0 - self.config.lambda_dssim) * rgb_loss + self.config.lambda_dssim * (1.0 - _ssim(output.rgb, target_rgb))
+            rendered_rgb = model.correct_exposure(output.rgb)
+            rgb_loss = F.l1_loss(rendered_rgb, target_rgb)
+            photo_loss = (1.0 - self.config.lambda_dssim) * rgb_loss + self.config.lambda_dssim * (1.0 - _ssim(rendered_rgb, target_rgb))
             target_depth = torch.from_numpy(frame.depth_m).to(self.device)
             valid_depth = (target_depth > 0) & (output.depth > 0)
             if self.config.optimize_depth and bool(valid_depth.any()):
@@ -275,7 +338,15 @@ class LICMappingTrainer:
                 depth_loss = output.depth.sum() * 0.0
             loss = self.config.rgb_weight * photo_loss + self.config.depth_weight * depth_loss
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite LIC mapping loss at frame {frame.index}")
+                raise FloatingPointError(
+                    f"Non-finite LIC mapping loss at frame {frame.index}: "
+                    f"rgb={float(rgb_loss.detach())}, photo={float(photo_loss.detach())}, "
+                    f"depth={float(depth_loss.detach())}, "
+                    f"raw_finite={bool(torch.isfinite(output.rgb).all())}, "
+                    f"rendered_finite={bool(torch.isfinite(rendered_rgb).all())}, "
+                    f"target_finite={bool(torch.isfinite(target_rgb).all())}, "
+                    f"parameter_finite={all(bool(torch.isfinite(parameter).all()) for parameter in model.parameters())}"
+                )
             loss.backward()
             optimizer.step()
             final_rgb = float(rgb_loss.detach())
@@ -352,12 +423,22 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-gaussians", type=int, default=250_000)
     parser.add_argument("--prune-every", type=int, default=5)
     parser.add_argument("--prune-opacity", type=float, default=0.01)
+    parser.add_argument("--spnet-engine", type=Path, default=None)
+    parser.add_argument("--spnet-torchscript", type=Path, default=None)
+    parser.add_argument("--spnet-patch-size", type=int, default=10)
+    parser.add_argument("--spnet-max-depth", type=float, default=20.0)
+    parser.add_argument("--no-exposure", action="store_true")
+    parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument("--no-artifacts", action="store_true")
+    parser.add_argument("--lpips-model", type=Path, default=None)
     parser.add_argument("--resize-width", type=int, default=None)
     parser.add_argument("--resize-height", type=int, default=None)
     args = parser.parse_args(argv)
     if (args.resize_width is None) != (args.resize_height is None):
         parser.error("--resize-width and --resize-height must be provided together")
     resize = None if args.resize_width is None else (args.resize_width, args.resize_height)
+    if args.spnet_engine is not None and args.spnet_torchscript is not None:
+        parser.error("--spnet-engine and --spnet-torchscript are mutually exclusive")
     reader = RosbagReader(args.rosbag, args.calibration, resize=resize)
     frames = reader.frames(limit=args.frame_limit)
     config = TrainingConfig(
@@ -367,11 +448,33 @@ def _main(argv: list[str] | None = None) -> int:
         max_gaussians=args.max_gaussians,
         prune_every_n_keyframes=args.prune_every,
         prune_opacity_threshold=args.prune_opacity,
+        depth_completion=args.spnet_engine is not None or args.spnet_torchscript is not None,
+        depth_completion_patch_size=args.spnet_patch_size,
+        depth_completion_max_depth_m=args.spnet_max_depth,
+        optimize_exposure=not args.no_exposure,
     )
-    model, report = LICMappingTrainer(config, device=args.device).fit(frames)
+    completer = None
+    if args.spnet_engine is not None:
+        from .spnet import TensorRTDepthCompleter
+        if resize is None:
+            parser.error("--spnet-engine requires --resize-width/--resize-height")
+        completer = TensorRTDepthCompleter(args.spnet_engine, width=resize[0], height=resize[1], device=args.device)
+    elif args.spnet_torchscript is not None:
+        from .spnet import TorchScriptDepthCompleter
+        completer = TorchScriptDepthCompleter(args.spnet_torchscript, device=args.device)
+    trainer = LICMappingTrainer(config, device=args.device, depth_completer=completer)
+    model, report = trainer.fit(frames)
     report["skipped_pose_frames"] = reader.skipped_pose_frames
     report["rejected_source_frames"] = reader.rejected_source_frames
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    artifact_dir = args.artifact_dir or args.output.with_name(f"{args.output.stem}_artifacts")
+    if not args.no_artifacts:
+        from .evaluation import evaluate_final_map
+        evaluation = evaluate_final_map(model, trainer.last_keyframes, artifact_dir, lpips_model=args.lpips_model)
+        report["evaluation"] = {
+            "artifact_dir": str(artifact_dir),
+            "aggregate": evaluation["aggregate"],
+        }
     torch.save({"state_dict": model.state_dict(), "report": report}, args.output)
     args.output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({

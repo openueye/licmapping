@@ -20,6 +20,7 @@ IMAGE_TOPIC = "/odin1/image/compressed"
 ODOMETRY_TOPIC = "/odin1/odometry"
 SLAM_CLOUD_TOPIC = "/odin1/cloud_slam"
 SOURCE_INVALID = np.uint8(255)
+SOURCE_SPNET = np.uint8(2)  # SAGE SourceType.SPNET_BLIND
 SOURCE_CENTER = np.uint8(3)  # SAGE SourceType.LIDAR_SLAM_CENTER
 SOURCE_FUSED5 = np.uint8(4)  # SAGE SourceType.LIDAR_SLAM_FUSED5
 _POINTFIELD_DTYPES = {

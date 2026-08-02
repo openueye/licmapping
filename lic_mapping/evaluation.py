@@ -295,6 +295,8 @@ def _write_gaussian_artifacts(model: GaussianMap, output_dir: Path) -> None:
         "means3d": model.means3d.detach().cpu().numpy(),
         "dc": model.dc.detach().cpu().numpy(),
         "sh_rest": model.sh_rest.detach().cpu().numpy(),
+        "opacity_logits": model.opacity_logits.detach().cpu().numpy(),
+        "log_scales": model.log_scales.detach().cpu().numpy(),
         "opacity": model.opacities.detach().cpu().numpy(),
         "scales": model.scales.detach().cpu().numpy(),
         "rotations": torch.nn.functional.normalize(model.rotations, dim=1).detach().cpu().numpy(),
@@ -302,29 +304,84 @@ def _write_gaussian_artifacts(model: GaussianMap, output_dir: Path) -> None:
         "source_confidences": model.source_confidences.detach().cpu().numpy(),
     }
     np.savez_compressed(output_dir / "gaussians.npz", **arrays)
-    colors = np.clip(arrays["dc"][:, 0, :] * 0.28209479177387814 + 0.5, 0, 1)
-    _write_ply(output_dir / "point_cloud.ply", arrays["means3d"], colors, arrays["opacity"], arrays["scales"])
+    _write_ply(
+        output_dir / "point_cloud.ply",
+        arrays["means3d"],
+        arrays["dc"],
+        arrays["sh_rest"],
+        arrays["opacity_logits"],
+        arrays["log_scales"],
+        arrays["rotations"],
+    )
 
 
-def _write_ply(path: Path, means: np.ndarray, colors: np.ndarray, opacity: np.ndarray, scales: np.ndarray) -> None:
+def _write_ply(
+    path: Path,
+    means: np.ndarray,
+    dc: np.ndarray,
+    sh_rest: np.ndarray,
+    opacity_logits: np.ndarray,
+    log_scales: np.ndarray,
+    rotations: np.ndarray,
+) -> None:
+    """Write the standard Gaussian-Splatting PLY schema.
+
+    The viewer-facing PLY stores trainable Gaussian parameters, not an RGB
+    point-cloud approximation: SH coefficients are raw values, opacity is a
+    logit, and scales are logarithmic. This matches the conventional
+    Gaussian-Splatting ``save_ply`` format used by external viewers.
+    """
+    means = np.asarray(means, dtype=np.float32)
+    dc = np.asarray(dc, dtype=np.float32)
+    sh_rest = np.asarray(sh_rest, dtype=np.float32)
+    opacity_logits = np.asarray(opacity_logits, dtype=np.float32).reshape(-1, 1)
+    log_scales = np.asarray(log_scales, dtype=np.float32)
+    rotations = np.asarray(rotations, dtype=np.float32)
+    count = len(means)
+    if means.shape != (count, 3):
+        raise ValueError("Gaussian PLY means must have shape [N, 3]")
+    if dc.shape != (count, 1, 3):
+        raise ValueError("Gaussian PLY dc must have shape [N, 1, 3]")
+    if sh_rest.ndim != 3 or sh_rest.shape[0] != count or sh_rest.shape[2] != 3:
+        raise ValueError("Gaussian PLY sh_rest must have shape [N, K, 3]")
+    if opacity_logits.shape != (count, 1):
+        raise ValueError("Gaussian PLY opacity_logits must have shape [N, 1]")
+    if log_scales.shape != (count, 3):
+        raise ValueError("Gaussian PLY log_scales must have shape [N, 3]")
+    if rotations.shape != (count, 4):
+        raise ValueError("Gaussian PLY rotations must have shape [N, 4]")
+    if not all(
+        bool(np.isfinite(values).all())
+        for values in (means, dc, sh_rest, opacity_logits, log_scales, rotations)
+    ):
+        raise ValueError("Gaussian PLY parameters must be finite")
+
+    properties = ["x", "y", "z", "nx", "ny", "nz"]
+    properties.extend(f"f_dc_{index}" for index in range(3))
+    properties.extend(f"f_rest_{index}" for index in range(sh_rest.shape[1] * 3))
+    properties.append("opacity")
+    properties.extend(f"scale_{index}" for index in range(3))
+    properties.extend(f"rot_{index}" for index in range(4))
     count = len(means)
     header = (
         "ply\nformat binary_little_endian 1.0\n"
         f"element vertex {count}\n"
-        "property float x\nproperty float y\nproperty float z\n"
-        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-        "property float opacity\nproperty float scale_x\nproperty float scale_y\nproperty float scale_z\nend_header\n"
+        + "".join(f"property float {name}\n" for name in properties)
+        + "end_header\n"
     ).encode("ascii")
-    dtype = np.dtype([
-        ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-        ("red", "u1"), ("green", "u1"), ("blue", "u1"),
-        ("opacity", "<f4"), ("scale_x", "<f4"), ("scale_y", "<f4"), ("scale_z", "<f4"),
-    ])
+    attributes = np.concatenate((
+        means,
+        np.zeros_like(means),
+        dc.reshape(count, 3),
+        sh_rest.reshape(count, -1),
+        opacity_logits,
+        log_scales,
+        rotations,
+    ), axis=1)
+    dtype = np.dtype([(name, "<f4") for name in properties])
     vertices = np.empty(count, dtype=dtype)
-    vertices["x"], vertices["y"], vertices["z"] = means[:, 0], means[:, 1], means[:, 2]
-    vertices["red"], vertices["green"], vertices["blue"] = (colors * 255).round().astype(np.uint8).T
-    vertices["opacity"] = np.asarray(opacity).reshape(-1)
-    vertices["scale_x"], vertices["scale_y"], vertices["scale_z"] = scales[:, 0], scales[:, 1], scales[:, 2]
+    for index, name in enumerate(properties):
+        vertices[name] = attributes[:, index]
     with path.open("wb") as stream:
         stream.write(header)
         vertices.tofile(stream)

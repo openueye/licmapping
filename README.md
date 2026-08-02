@@ -120,7 +120,9 @@ image, point-cloud, and calibration decode errors remain hard failures.
 At the end of a CLI run, `<output-stem>_artifacts/` contains `metrics.json`
 (per-keyframe and aggregate PSNR/SSIM/depth/alpha metrics), rendered and target
 RGB PNGs, depth arrays/colour maps, alpha and absolute-error maps, and
-`map/gaussians.npz` plus a binary `point_cloud.ply`. The retained-keyframe
+`map/gaussians.npz` plus a standard 3DGS `point_cloud.ply`. The PLY contains
+the raw DC/SH coefficients, opacity logits, log-scales and rotations, with
+`f_rest_*` generated according to the selected `sh_degree`. The retained-keyframe
 metrics use SAGE's offline AlexNet LPIPS, PSNR, and Gaussian-window SSIM
 protocol. The AlexNet checkpoint is loaded from
 `00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth` by default and can be

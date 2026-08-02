@@ -17,8 +17,9 @@ python -m pip install --no-build-isolation --no-deps --force-reinstall .
 ## Run
 
 ```bash
-cp config/downtown1.local.example.yaml config/downtown1.local.yaml
-python -m lic_mapping.trainer --config config/downtown1.local.yaml
+cd /home/haibo/Documents/Thesis
+python -m lic_mapping.trainer \
+  --config 00_Baselines/licmapping/config/downtown1_sh0.yaml
 ```
 
 `downtown1_sh0.yaml`–`downtown1_sh3.yaml` 是当前工作区的正式训练配置（SH
@@ -49,16 +50,23 @@ Odin ROS2 bag 缺少参考实现的上游 depth topic。经实验授权，前端
 ## Tests
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 conda run -n licmap python -m pytest -q
+cd /home/haibo/Documents/Thesis
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 conda run -n licmap \
+  python -m pytest -q 00_Baselines/licmapping/tests
 ```
 
 绑定层 parity 测试独立重建 `Camera` 的 C++ 矩阵约定，并比较 Python adapter 与
 direct Gaussian-LIC binding 的 RGB、depth、transmittance、radii 和 gradient：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 conda run -n licmap python -m pytest -q \
-  tests/test_mapping_contract.py tests/test_native_parity.py
+cd /home/haibo/Documents/Thesis
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 conda run -n licmap \
+  python -m pytest -q 00_Baselines/licmapping/tests/test_mapping_contract.py \
+  00_Baselines/licmapping/tests/test_native_parity.py
 ```
+
+运行入口要从 Thesis 根目录启动；若从 `00_Baselines/licmapping` 启动，当前
+源码目录会遮蔽 `licmap` 环境中已安装的 CUDA 扩展包。
 
 ## Outputs and limits
 

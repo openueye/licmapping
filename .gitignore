@@ -1,0 +1,12 @@
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.obj
+__pycache__/
+.pytest_cache/
+.ninja_deps
+.ninja_log
+*.pt
+*.pth

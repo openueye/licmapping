@@ -35,7 +35,13 @@ def _frame(index: int, points: np.ndarray) -> BagFrame:
 def test_fixed_pose_training_loop_accumulates_and_updates(capsys: pytest.CaptureFixture[str]) -> None:
     frames = [
         _frame(0, np.asarray([[-0.2, 0, 2], [0.2, 0, 2], [0, -0.2, 2]], dtype=np.float32)),
-        _frame(1, np.asarray([[-0.2, 0, 2], [0.2, 0, 2], [0, 0.2, 2], [0.3, 0.2, 2]], dtype=np.float32)),
+        *(
+            _frame(
+                index,
+                np.asarray([[-0.2, 0, 2], [0.2, 0, 2], [0, 0.2, 2], [0.3, 0.2, 2]], dtype=np.float32),
+            )
+            for index in range(1, 20)
+        ),
     ]
     trainer = LICMappingTrainer(
         TrainingConfig(
@@ -49,12 +55,11 @@ def test_fixed_pose_training_loop_accumulates_and_updates(capsys: pytest.Capture
     )
     model, report = trainer.fit(frames)
 
-    assert model.count == 7
-    assert report["frames"] == 2
-    assert len(report["history"]) == 2
+    assert model.count > 3
+    assert report["frames"] == 20
+    assert len(report["history"]) == 20
     assert all(np.isfinite(record["loss"]) for record in report["history"])
     output = capsys.readouterr().out
-    assert "LIC mapping start:" in output
-    assert "LIC mapping frame 1:" in output
-    assert "LIC keyframe 2:" in output
-    assert "LIC mapping complete:" in output
+    assert "LIC keyframe 20: frame=19" in output
+    assert "optimized_views=" in output
+    assert "LIC keyframe 1:" not in output

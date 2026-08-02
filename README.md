@@ -22,6 +22,27 @@ python -m pytest -q
 An editable install is also supported with
 `python -m pip install -e . --no-build-isolation`.
 
+## Fixed-pose ROSBAG training
+
+The first end-to-end mapping loop reads the Odin ROS2 bag topics
+`/odin1/image/compressed`, `/odin1/odometry`, and `/odin1/cloud_slam`, performs
+FishPoly rectification and strict pose interpolation, initializes Gaussians from
+the world-frame cloud, appends new voxels over time, and optimizes RGB plus
+optional LiDAR depth loss while keeping all poses frozen:
+
+```bash
+python -m lic_mapping.trainer \
+  --rosbag /path/to/odin-bag \
+  --calibration /path/to/cam_in_ex.txt \
+  --output outputs/lic_mapping/checkpoint.pt \
+  --resize-width 800 --resize-height 648 \
+  --iterations 30
+```
+
+This is intentionally a minimal backend baseline. It does not yet implement
+SAGE's centered-five source fusion, SPNet prior, pruning policy, or formal
+artifact receipts.
+
 The public Python interface is deliberately small:
 
 ```python

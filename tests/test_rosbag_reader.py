@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lic_mapping.rosbag import RosbagReader
+from lic_mapping.rosbag import CameraIntrinsics, RosbagReader, SOURCE_CENTER, _CenteredFiveProjector, _SourceSlot
 
 
 def _align(buffer: bytearray, alignment: int) -> None:
@@ -68,7 +68,7 @@ def _cloud(timestamp_ns: int) -> bytes:
     _align(buffer, 4)
     buffer.extend(struct.pack("<II", 16, 48))
     points = np.asarray(
-        [(0.0, 0.0, 2.0, 0xFF0000), (0.2, 0.0, 2.0, 0x00FF00), (0.0, 0.2, 2.0, 0x0000FF)],
+        [(0.0, 0.0, 2.0, 0xFF0000), (0.5, 0.0, 2.0, 0x00FF00), (0.0, 0.5, 2.0, 0x0000FF)],
         dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<u4")],
     )
     buffer.extend(struct.pack("<I", points.nbytes))
@@ -126,20 +126,39 @@ def test_rosbag_reader_builds_fixed_pose_frame(tmp_path: Path) -> None:
             "INSERT INTO messages(topic_id, timestamp, data) VALUES (?, ?, ?)",
             [
                 (1, 0, _image(0)),
-                (1, 550_000_000, _image(550_000_000)),
-                (2, 500_000_000, _odom(500_000_000, 0.0)),
-                (2, 600_000_000, _odom(600_000_000, 1.0)),
-                (3, 550_000_000, _cloud(550_000_000)),
+                *[(1, timestamp, _image(timestamp)) for timestamp in range(500_000_000, 1_200_000_000, 100_000_000)],
+                *[(2, timestamp, _odom(timestamp, 0.0)) for timestamp in range(500_000_000, 1_200_000_000, 100_000_000)],
+                *[(3, timestamp, _cloud(timestamp)) for timestamp in range(500_000_000, 1_200_000_000, 100_000_000)],
             ],
         )
         connection.commit()
 
     reader = RosbagReader(bag, bag / "cam_in_ex.txt", max_sync_dt_ms=100.0)
-    frames = reader.frames()
+    frames = reader.frames(limit=1)
 
     assert len(frames) == 1
     assert reader.skipped_pose_frames == 1
     assert frames[0].rgb.shape == (8, 8, 3)
-    assert np.isclose(frames[0].world_from_camera[0, 3], 0.5)
+    assert np.isclose(frames[0].world_from_camera[0, 3], 0.0)
     assert frames[0].points_world.shape == (3, 3)
     assert np.count_nonzero(frames[0].depth_m) > 0
+    assert np.all(frames[0].source_types[frames[0].depth_m > 0] == SOURCE_CENTER)
+
+
+def test_centered_five_rejects_conflict_but_restores_center() -> None:
+    intrinsics = CameraIntrinsics(8, 8, 4.0, 4.0, 3.0, 3.0)
+    rgb = np.zeros((8, 8, 3), dtype=np.float32)
+    pose = np.eye(4, dtype=np.float64)
+    slots = []
+    for index in range(5):
+        depth = 2.0 if index == 2 else (4.0 if index == 0 else 0.0)
+        points = np.asarray([[0.0, 0.0, depth]], dtype=np.float32) if depth else np.empty((0, 3), dtype=np.float32)
+        slots.append(_SourceSlot(index, index, rgb, pose, points))
+    center, fused = _CenteredFiveProjector(intrinsics).project(tuple(slots))
+    assert np.isclose(center[3, 3], 2.0)
+    assert np.isclose(fused[3, 3], 2.0)
+
+    slots[2] = _SourceSlot(2, 2, rgb, pose, np.empty((0, 3), dtype=np.float32))
+    center, fused = _CenteredFiveProjector(intrinsics).project(tuple(slots))
+    assert np.isclose(center[3, 3], 0.0)
+    assert np.isclose(fused[3, 3], 4.0)

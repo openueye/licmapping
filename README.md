@@ -24,11 +24,20 @@ An editable install is also supported with
 
 ## Fixed-pose ROSBAG training
 
-The first end-to-end mapping loop reads the Odin ROS2 bag topics
+The mapping input reads the Odin ROS2 bag topics
 `/odin1/image/compressed`, `/odin1/odometry`, and `/odin1/cloud_slam`, performs
-FishPoly rectification and strict pose interpolation, initializes Gaussians from
-the world-frame cloud, appends new voxels over time, and optimizes RGB plus
-optional LiDAR depth loss while keeping all poses frozen:
+FishPoly rectification and strict pose interpolation, and keeps the original
+image-slot sequence fixed. Five consecutive finalized source slots (`t-2` to
+`t+2`) are projected into the target camera with a nearest-depth z-buffer over
+`[0.1, 200]` m. The minimum valid depth is fused, conflicts larger than 1 m
+are rejected, and valid center depth is restored with center priority.
+
+The resulting mapping depth uses the center source wherever available and the
+centered-five source only to fill center holes. Its source type and confidence
+(`1.0` for center, `0.7` for fused-five) are retained through Gaussian
+initialization and append. Gaussians use `z / focal` with the configured
+`(0.95, 1.05, 1.20)` scale anisotropy, opacity `0.5` by default, identity
+rotation, and append-only first-wins 5 cm `floor` voxel deduplication:
 
 ```bash
 python -m lic_mapping.trainer \
@@ -40,13 +49,16 @@ python -m lic_mapping.trainer \
 ```
 
 Images without an interpolable odometry pose, such as the startup gap in
-some bags, are skipped automatically. The CLI reports the skipped count in
-its JSON output and records it in the checkpoint report; image, point-cloud,
-and calibration errors remain hard failures.
+some bags, remain rejected slots rather than being compressed out of the
+five-slot window. The CLI reports pose and source-slot rejection counts in its
+JSON output and records them in the checkpoint report; image, point-cloud, and
+calibration decode errors remain hard failures.
 
 This is intentionally a minimal backend baseline. It does not yet implement
-SAGE's centered-five source fusion, SPNet prior, pruning policy, or formal
-artifact receipts.
+the SPNet prior, rendered growth gates, pruning policy, or formal artifact
+receipts. The centered-five contract is taken from the workspace SAGE data
+path; the literal LIC2 C++ reference itself uses cumulative point-cloud
+extension rather than a centered-five window.
 
 The public Python interface is deliberately small:
 

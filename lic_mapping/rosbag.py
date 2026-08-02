@@ -4,6 +4,7 @@ import bisect
 import re
 import sqlite3
 import struct
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from .rasterizer import LicCamera
 IMAGE_TOPIC = "/odin1/image/compressed"
 ODOMETRY_TOPIC = "/odin1/odometry"
 SLAM_CLOUD_TOPIC = "/odin1/cloud_slam"
+SOURCE_INVALID = np.uint8(255)
+SOURCE_CENTER = np.uint8(3)  # SAGE SourceType.LIDAR_SLAM_CENTER
+SOURCE_FUSED5 = np.uint8(4)  # SAGE SourceType.LIDAR_SLAM_FUSED5
 _POINTFIELD_DTYPES = {
     1: np.int8,
     2: np.uint8,
@@ -51,6 +55,12 @@ class BagFrame:
     world_from_camera: np.ndarray
     points_world: np.ndarray
     point_colors: np.ndarray
+    center_depth_m: np.ndarray | None = None
+    fused5_depth_m: np.ndarray | None = None
+    source_types: np.ndarray | None = None
+    source_confidences: np.ndarray | None = None
+    point_source_types: np.ndarray | None = None
+    point_source_confidences: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         expected = (self.intrinsics.height, self.intrinsics.width)
@@ -58,10 +68,51 @@ class BagFrame:
         depth = np.asarray(self.depth_m)
         points = np.asarray(self.points_world)
         colors = np.asarray(self.point_colors)
+        center_depth = depth.copy() if self.center_depth_m is None else np.asarray(self.center_depth_m)
+        fused5_depth = np.zeros_like(depth) if self.fused5_depth_m is None else np.asarray(self.fused5_depth_m)
+        source_types = (
+            np.where(depth > 0, SOURCE_CENTER, SOURCE_INVALID).astype(np.uint8)
+            if self.source_types is None
+            else np.asarray(self.source_types)
+        )
+        source_confidences = (
+            (depth > 0).astype(np.float32)
+            if self.source_confidences is None
+            else np.asarray(self.source_confidences)
+        )
+        point_source_types = (
+            np.full(len(points), SOURCE_CENTER, dtype=np.uint8)
+            if self.point_source_types is None
+            else np.asarray(self.point_source_types)
+        )
+        point_source_confidences = (
+            np.ones(len(points), dtype=np.float32)
+            if self.point_source_confidences is None
+            else np.asarray(self.point_source_confidences)
+        )
+        object.__setattr__(self, "center_depth_m", center_depth)
+        object.__setattr__(self, "fused5_depth_m", fused5_depth)
+        object.__setattr__(self, "source_types", source_types)
+        object.__setattr__(self, "source_confidences", source_confidences)
+        object.__setattr__(self, "point_source_types", point_source_types)
+        object.__setattr__(self, "point_source_confidences", point_source_confidences)
         if rgb.shape != (*expected, 3) or rgb.dtype != np.float32:
             raise ValueError("BagFrame.rgb must be float32 HxWx3")
         if depth.shape != expected or depth.dtype != np.float32:
             raise ValueError("BagFrame.depth_m must be float32 HxW")
+        for name, value in (
+            ("center_depth_m", center_depth),
+            ("fused5_depth_m", fused5_depth),
+            ("source_confidences", source_confidences),
+        ):
+            if value.shape != expected or value.dtype != np.float32:
+                raise ValueError(f"BagFrame.{name} has an invalid shape or dtype")
+        if source_types.shape != expected or source_types.dtype != np.uint8:
+            raise ValueError("BagFrame.source_types must be uint8 HxW")
+        if point_source_types.shape != (len(points),) or point_source_types.dtype != np.uint8:
+            raise ValueError("BagFrame.point_source_types must be uint8 N")
+        if point_source_confidences.shape != (len(points),) or point_source_confidences.dtype != np.float32:
+            raise ValueError("BagFrame.point_source_confidences must be float32 N")
         if points.ndim != 2 or points.shape[1] != 3 or points.dtype != np.float32:
             raise ValueError("BagFrame.points_world must be float32 Nx3")
         if colors.shape != (len(points), 3) or colors.dtype != np.float32:
@@ -70,6 +121,17 @@ class BagFrame:
             raise ValueError("BagFrame.rgb must be finite and within [0, 1]")
         if not np.isfinite(depth).all() or (depth < 0).any():
             raise ValueError("BagFrame.depth_m must be finite and non-negative")
+        if (
+            not np.isfinite(center_depth).all()
+            or (center_depth < 0).any()
+            or not np.isfinite(fused5_depth).all()
+            or (fused5_depth < 0).any()
+            or not np.isfinite(source_confidences).all()
+            or (source_confidences < 0).any()
+            or not np.isfinite(point_source_confidences).all()
+            or (point_source_confidences < 0).any()
+        ):
+            raise ValueError("BagFrame source depth data must be finite and non-negative")
         if not np.isfinite(points).all() or not np.isfinite(colors).all():
             raise ValueError("BagFrame point data must be finite")
         pose = np.asarray(self.world_from_camera, dtype=np.float64)
@@ -104,6 +166,22 @@ class Calibration:
 class _Message:
     timestamp_ns: int
     data: bytes
+
+
+@dataclass(frozen=True)
+class _SourceSlot:
+    index: int
+    timestamp_ns: int
+    rgb: np.ndarray
+    world_from_camera: np.ndarray
+    points_world: np.ndarray
+
+
+@dataclass(frozen=True)
+class _RejectedSlot:
+    index: int
+    timestamp_ns: int
+    reason: str
 
 
 class PoseSyncError(ValueError):
@@ -300,10 +378,12 @@ class PoseTrack:
 
     def interpolate(self, timestamp_ns: int, *, max_dt_ns: int) -> np.ndarray:
         index = bisect.bisect_left(self._timestamps, int(timestamp_ns))
+        if index < len(self._timestamps) and self._timestamps[index] == timestamp_ns:
+            return self._poses[index].copy()
+        if index == len(self._timestamps) and self._timestamps[-1] == timestamp_ns:
+            return self._poses[-1].copy()
         if index == 0 or index == len(self._timestamps):
             raise PoseSyncError("Image timestamp is outside odometry coverage")
-        if self._timestamps[index] == timestamp_ns:
-            return self._poses[index].copy()
         left, right = index - 1, index
         dt_left = timestamp_ns - self._timestamps[left]
         dt_right = self._timestamps[right] - timestamp_ns
@@ -412,11 +492,19 @@ def _bag_shards(root: Path) -> tuple[Path, ...]:
 
 
 class RosbagReader:
-    """Read a finite Odin ROS2 bag into fixed-pose RGB/world-cloud frames."""
+    """Read fixed-pose Odin frames with LIC/SAGE centered-five fusion."""
 
-    def __init__(self, rosbag_dir: Path, calibration_path: Path, *, max_sync_dt_ms: float = 50.0, resize: tuple[int, int] | None = None) -> None:
-        if max_sync_dt_ms <= 0:
-            raise ValueError("max_sync_dt_ms must be positive")
+    def __init__(
+        self,
+        rosbag_dir: Path,
+        calibration_path: Path,
+        *,
+        max_sync_dt_ms: float = 50.0,
+        max_cloud_dt_ms: float = 20.0,
+        resize: tuple[int, int] | None = None,
+    ) -> None:
+        if max_sync_dt_ms <= 0 or max_cloud_dt_ms <= 0:
+            raise ValueError("max_sync_dt_ms and max_cloud_dt_ms must be positive")
         if resize is not None and (len(resize) != 2 or resize[0] < 1 or resize[1] < 1):
             raise ValueError("resize must contain positive width and height")
         self.root = Path(rosbag_dir).resolve()
@@ -467,8 +555,10 @@ class RosbagReader:
         self._cloud_timestamps = [item.timestamp_ns for item in self._clouds]
         self._poses = PoseTrack(poses)
         self._max_sync_dt_ns = int(round(max_sync_dt_ms * 1_000_000))
+        self._max_cloud_dt_ns = int(round(max_cloud_dt_ms * 1_000_000))
         self._lidar_from_camera = np.linalg.inv(self.calibration.t_camera_from_lidar)
         self._skipped_pose_frames = 0
+        self._rejected_source_frames = 0
 
     def __len__(self) -> int:
         return len(self._images)
@@ -478,22 +568,36 @@ class RosbagReader:
         """Number of image frames skipped by the most recent frames() call."""
         return self._skipped_pose_frames
 
+    @property
+    def rejected_source_frames(self) -> int:
+        """Number of source slots rejected for missing or unsynchronized clouds."""
+        return self._rejected_source_frames
+
     def frames(self, *, start: int = 0, limit: int | None = None) -> list[BagFrame]:
         if start < 0 or (limit is not None and limit < 1):
             raise ValueError("start must be non-negative and limit must be positive")
         self._skipped_pose_frames = 0
+        self._rejected_source_frames = 0
         result = []
+        window: deque[_SourceSlot | _RejectedSlot] = deque(maxlen=5)
         for index, image in enumerate(self._images[start:], start=start):
-            try:
-                result.append(self._build_frame(index, image))
-            except PoseSyncError:
-                self._skipped_pose_frames += 1
+            slot = self._build_source_slot(index, image)
+            if isinstance(slot, _RejectedSlot):
+                if slot.reason == "pose":
+                    self._skipped_pose_frames += 1
+                else:
+                    self._rejected_source_frames += 1
+            window.append(slot)
+            if len(window) < window.maxlen:
                 continue
+            if any(isinstance(item, _RejectedSlot) for item in window):
+                continue
+            result.append(self._build_fused_frame(tuple(window)))
             if limit is not None and len(result) >= limit:
                 break
         return result
 
-    def _build_frame(self, index: int, image: _Message) -> BagFrame:
+    def _build_source_slot(self, index: int, image: _Message) -> _SourceSlot | _RejectedSlot:
         timestamp, _frame_id, compressed = _parse_image(image.data)
         bgr = cv2.imdecode(np.frombuffer(compressed, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
@@ -503,39 +607,151 @@ class RosbagReader:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         if self._resize is not None:
             rgb = cv2.resize(rgb, self._resize, interpolation=cv2.INTER_AREA).astype(np.float32)
-        world_from_base = self._poses.interpolate(timestamp, max_dt_ns=self._max_sync_dt_ns)
+        try:
+            world_from_base = self._poses.interpolate(timestamp, max_dt_ns=self._max_sync_dt_ns)
+        except PoseSyncError:
+            return _RejectedSlot(index, timestamp, "pose")
         world_from_camera = world_from_base @ self._lidar_from_camera
         right = bisect.bisect_left(self._cloud_timestamps, timestamp)
         candidates = self._clouds[max(0, right - 1) : min(len(self._clouds), right + 1)]
+        if not candidates:
+            return _RejectedSlot(index, timestamp, "cloud")
         cloud = min(candidates, key=lambda item: abs(item.timestamp_ns - timestamp))
-        if abs(cloud.timestamp_ns - timestamp) > self._max_sync_dt_ns:
-            raise ValueError(f"No cloud timestamp near image {index}")
+        if abs(cloud.timestamp_ns - timestamp) > self._max_cloud_dt_ns:
+            return _RejectedSlot(index, timestamp, "cloud")
         cloud_message = _parse_pointcloud(cloud.data)
-        points, cloud_colors = _decode_cloud(cloud_message)
-        depth, sampled_colors, visible = _project_cloud(points, rgb, world_from_camera, self.intrinsics)
-        if cloud_colors is None:
-            points, sampled_colors = points[visible], sampled_colors[visible]
-        else:
-            sampled_colors = cloud_colors
-        return BagFrame(index, timestamp, rgb, depth, self.intrinsics, world_from_camera, points, sampled_colors)
+        points, _cloud_colors = _decode_cloud(cloud_message)
+        return _SourceSlot(index, timestamp, rgb, world_from_camera, points)
+
+    def _build_fused_frame(self, slots: tuple[_SourceSlot, ...]) -> BagFrame:
+        target = slots[2]
+        center_depth, fused5_depth = _CenteredFiveProjector(self.intrinsics).project(slots)
+
+        center_valid = center_depth > 0
+        source_types = np.full(center_depth.shape, SOURCE_INVALID, dtype=np.uint8)
+        source_types[center_valid] = SOURCE_CENTER
+        fused_valid = fused5_depth > 0
+        source_types[~center_valid & fused_valid] = SOURCE_FUSED5
+        source_confidences = np.zeros(center_depth.shape, dtype=np.float32)
+        source_confidences[center_valid] = 1.0
+        source_confidences[~center_valid & fused_valid] = 0.7
+        mapping_depth = np.where(center_valid, center_depth, fused5_depth).astype(np.float32)
+        points, colors, point_types, point_confidences = _backproject_depth(
+            mapping_depth,
+            target.rgb,
+            target.world_from_camera,
+            self.intrinsics,
+            source_types,
+            source_confidences,
+        )
+        return BagFrame(
+            target.index,
+            target.timestamp_ns,
+            target.rgb,
+            mapping_depth,
+            self.intrinsics,
+            target.world_from_camera,
+            points,
+            colors,
+            center_depth_m=center_depth,
+            fused5_depth_m=fused5_depth,
+            source_types=source_types,
+            source_confidences=source_confidences,
+            point_source_types=point_types,
+            point_source_confidences=point_confidences,
+        )
 
 
-def _project_cloud(points: np.ndarray, rgb: np.ndarray, world_from_camera: np.ndarray, intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+class _CenteredFiveProjector:
+    """Deterministic t-2..t+2 z-buffer fusion used by the source-frame adapter."""
+
+    def __init__(self, intrinsics: CameraIntrinsics, *, min_depth: float = 0.1, max_depth: float = 200.0, conflict_threshold: float = 1.0) -> None:
+        self.intrinsics = intrinsics
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.conflict_threshold = conflict_threshold
+
+    def project(self, slots: tuple[_SourceSlot, ...]) -> tuple[np.ndarray, np.ndarray]:
+        if len(slots) != 5:
+            raise ValueError("Centered-five fusion requires exactly five source slots")
+        depths = np.stack(
+            [
+                _project_depth(
+                    slot.points_world,
+                    slots[2].world_from_camera,
+                    self.intrinsics,
+                    min_depth=self.min_depth,
+                    max_depth=self.max_depth,
+                )
+                for slot in slots
+            ],
+            axis=0,
+        )
+        valid = depths > 0
+        valid_count = valid.sum(axis=0)
+        minimum = np.min(np.where(valid, depths, np.inf), axis=0)
+        maximum = np.max(np.where(valid, depths, -np.inf), axis=0)
+        fused = np.where(valid_count > 0, minimum, 0).astype(np.float32)
+        conflicts = (valid_count > 1) & ((maximum - minimum) > self.conflict_threshold)
+        fused[conflicts] = 0
+        center_valid = depths[2] > 0
+        fused[center_valid] = depths[2][center_valid]
+        return depths[2], fused
+
+
+def _project_depth(
+    points_world: np.ndarray,
+    world_from_camera: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    *,
+    min_depth: float,
+    max_depth: float,
+) -> np.ndarray:
     camera_from_world = np.linalg.inv(world_from_camera)
-    points_h = np.concatenate((points.astype(np.float64), np.ones((len(points), 1))), axis=1)
+    points_h = np.concatenate((points_world.astype(np.float64), np.ones((len(points_world), 1))), axis=1)
     camera = (camera_from_world @ points_h.T).T[:, :3]
     z = camera[:, 2]
-    u = intrinsics.fx * camera[:, 0] / np.maximum(z, 1e-8) + intrinsics.cx
-    v = intrinsics.fy * camera[:, 1] / np.maximum(z, 1e-8) + intrinsics.cy
-    valid = np.isfinite(camera).all(axis=1) & (z > 0.1) & (u >= 0) & (u < intrinsics.width - 1) & (v >= 0) & (v < intrinsics.height - 1)
-    rows = np.clip(np.rint(v[valid]).astype(np.int64), 0, intrinsics.height - 1)
-    cols = np.clip(np.rint(u[valid]).astype(np.int64), 0, intrinsics.width - 1)
-    sampled = rgb[rows, cols]
-    depth = np.zeros((intrinsics.height, intrinsics.width), dtype=np.float32)
-    for row, col, value in zip(rows, cols, z[valid].astype(np.float32)):
-        current = depth[row, col]
-        if current == 0 or value < current:
-            depth[row, col] = value
-    visible = np.zeros(len(points), dtype=bool)
-    visible[np.flatnonzero(valid)] = True
-    return depth, sampled.astype(np.float32), visible
+    valid = (
+        np.isfinite(camera).all(axis=1)
+        & (z >= min_depth)
+        & (z <= max_depth)
+    )
+    projected_u = intrinsics.fx * camera[valid, 0] / z[valid] + intrinsics.cx
+    projected_v = intrinsics.fy * camera[valid, 1] / z[valid] + intrinsics.cy
+    rows = np.rint(projected_v).astype(np.int64)
+    cols = np.rint(projected_u).astype(np.int64)
+    inside = (
+        np.isfinite(projected_u)
+        & np.isfinite(projected_v)
+        & (rows >= 0)
+        & (rows < intrinsics.height)
+        & (cols >= 0)
+        & (cols < intrinsics.width)
+    )
+    rows, cols, projected_z = rows[inside], cols[inside], z[valid][inside]
+    zbuffer = np.full((intrinsics.height, intrinsics.width), np.inf, dtype=np.float32)
+    np.minimum.at(zbuffer, (rows, cols), projected_z.astype(np.float32))
+    return np.where(np.isfinite(zbuffer), zbuffer, 0).astype(np.float32)
+
+
+def _backproject_depth(
+    depth: np.ndarray,
+    rgb: np.ndarray,
+    world_from_camera: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    source_types: np.ndarray,
+    source_confidences: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rows, cols = np.nonzero(depth > 0)
+    z = depth[rows, cols].astype(np.float64)
+    x = (cols.astype(np.float64) - intrinsics.cx) * z / intrinsics.fx
+    y = (rows.astype(np.float64) - intrinsics.cy) * z / intrinsics.fy
+    camera_h = np.column_stack((x, y, z, np.ones_like(z)))
+    world = (world_from_camera.astype(np.float64) @ camera_h.T).T[:, :3]
+    colors = rgb[rows, cols]
+    return (
+        world.astype(np.float32),
+        colors.astype(np.float32),
+        source_types[rows, cols].astype(np.uint8),
+        source_confidences[rows, cols].astype(np.float32),
+    )

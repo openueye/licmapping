@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .rosbag import BagFrame
+from .rosbag import BagFrame, SOURCE_CENTER
 from .rasterizer import LicRenderOutput, render
 
 
@@ -27,6 +27,8 @@ class GaussianMap(nn.Module):
         rotations: torch.Tensor,
         *,
         voxel_size: float = 0.05,
+        source_types: torch.Tensor | None = None,
+        source_confidences: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.means3d = nn.Parameter(means3d)
@@ -34,6 +36,13 @@ class GaussianMap(nn.Module):
         self.opacity_logits = nn.Parameter(opacity_logits)
         self.log_scales = nn.Parameter(log_scales)
         self.rotations = nn.Parameter(rotations)
+        count = int(means3d.shape[0])
+        if source_types is None:
+            source_types = torch.full((count,), int(SOURCE_CENTER), dtype=torch.uint8, device=means3d.device)
+        if source_confidences is None:
+            source_confidences = torch.ones(count, dtype=torch.float32, device=means3d.device)
+        self.register_buffer("source_types", source_types.to(device=means3d.device, dtype=torch.uint8).contiguous())
+        self.register_buffer("source_confidences", source_confidences.to(device=means3d.device, dtype=torch.float32).contiguous())
         self.voxel_size = float(voxel_size)
         if not math.isfinite(self.voxel_size) or self.voxel_size <= 0:
             raise ValueError("voxel_size must be positive and finite")
@@ -79,6 +88,8 @@ class GaussianMap(nn.Module):
             log_scales,
             torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=target).repeat(len(points), 1),
             voxel_size=voxel_size,
+            source_types=torch.from_numpy(frame.point_source_types).to(target),
+            source_confidences=torch.from_numpy(frame.point_source_confidences).to(target),
         )
         model._voxel_keys = {
             tuple(np.floor(point / model.voxel_size).astype(np.int64).tolist())
@@ -134,6 +145,8 @@ class GaussianMap(nn.Module):
             frame.world_from_camera,
             frame.points_world[indices],
             frame.point_colors[indices],
+            point_source_types=frame.point_source_types[indices],
+            point_source_confidences=frame.point_source_confidences[indices],
         )
         additions = self._tensors_from_frame(
             candidate,
@@ -159,6 +172,8 @@ class GaussianMap(nn.Module):
             torch.full((len(means), 1), float(self.opacity_logits.detach()[0, 0]), device=target),
             torch.log(scales),
             torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=target).repeat(len(means), 1),
+            torch.from_numpy(frame.point_source_types).to(target),
+            torch.from_numpy(frame.point_source_confidences).to(target),
         )
 
     def _new_point_indices(self, points: np.ndarray, *, max_points: int | None) -> np.ndarray:
@@ -178,11 +193,13 @@ class GaussianMap(nn.Module):
     def _append_tensors(self, additions: tuple[torch.Tensor, ...], optimizer: torch.optim.Optimizer) -> None:
         old_count = self.count
         old_parameters = {name: getattr(self, name) for name in self.PARAMETER_NAMES}
-        for name, addition in zip(self.PARAMETER_NAMES, additions):
+        for name, addition in zip(self.PARAMETER_NAMES, additions[: len(self.PARAMETER_NAMES)]):
             old = old_parameters[name]
             new = nn.Parameter(torch.cat((old.detach(), addition.detach()), dim=0))
             self._replace_optimizer_parameter(optimizer, old, new, old_count)
             setattr(self, name, new)
+        self.source_types = torch.cat((self.source_types, additions[5].detach().to(self.source_types.device)), dim=0)
+        self.source_confidences = torch.cat((self.source_confidences, additions[6].detach().to(self.source_confidences.device)), dim=0)
         self._validate()
 
     @staticmethod
@@ -207,5 +224,11 @@ class GaussianMap(nn.Module):
             raise ValueError("GaussianMap means3d/dc shapes are invalid")
         if self.opacity_logits.shape != (count, 1) or self.log_scales.shape != (count, 3) or self.rotations.shape != (count, 4):
             raise ValueError("GaussianMap parameter shapes are invalid")
+        if self.source_types.shape != (count,) or self.source_types.dtype != torch.uint8:
+            raise ValueError("GaussianMap source_types shape or dtype is invalid")
+        if self.source_confidences.shape != (count,) or self.source_confidences.dtype != torch.float32:
+            raise ValueError("GaussianMap source_confidences shape or dtype is invalid")
         if not all(torch.isfinite(parameter).all() for parameter in self.parameters()):
             raise ValueError("GaussianMap parameters must be finite")
+        if not torch.isfinite(self.source_confidences).all() or (self.source_confidences < 0).any():
+            raise ValueError("GaussianMap source_confidences must be finite and non-negative")

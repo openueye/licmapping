@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from lic_mapping.gaussians import GaussianMap
-from lic_mapping.rosbag import BagFrame, CameraIntrinsics, PoseTrack, _decode_cloud
+from lic_mapping.rosbag import BagFrame, CameraIntrinsics, PoseTrack, SOURCE_CENTER, _decode_cloud
 
 
 def _frame(index: int, points: np.ndarray) -> BagFrame:
@@ -39,6 +39,9 @@ def test_pose_track_interpolates_translation_and_rotation() -> None:
 def test_gaussian_append_preserves_adam_state() -> None:
     initial = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
     model = GaussianMap.from_frame(initial, device="cpu", voxel_size=0.05)
+    assert model.source_types.shape == (3,)
+    assert torch.all(model.source_types == int(SOURCE_CENTER))
+    assert torch.allclose(model.scales / model.scales[:, :1], torch.tensor([1.0, 1.05 / 0.95, 1.20 / 0.95]))
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     (sum(parameter.square().mean() for parameter in model.parameters())).backward()
     optimizer.step()
@@ -48,6 +51,8 @@ def test_gaussian_append_preserves_adam_state() -> None:
 
     assert added == 2
     assert model.count == 5
+    assert model.source_types.shape == (5,)
+    assert torch.all(model.source_confidences == 1)
     assert optimizer.state[model.means3d]["exp_avg"].shape == (5, 3)
     optimizer.zero_grad(set_to_none=True)
     sum(parameter.square().mean() for parameter in model.parameters()).backward()

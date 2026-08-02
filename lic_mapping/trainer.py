@@ -23,6 +23,7 @@ class TrainingConfig:
     voxel_size: float = 0.05
     initial_opacity: float = 0.5
     scale_clamp_min: float = 1e-4
+    scale_anisotropy: tuple[float, float, float] = (0.95, 1.05, 1.20)
     learning_rate_means: float = 1.6e-4
     learning_rate_dc: float = 2.5e-3
     learning_rate_opacity: float = 5.0e-2
@@ -38,6 +39,8 @@ class TrainingConfig:
             raise ValueError("point budgets are invalid")
         if self.voxel_size <= 0 or self.scale_clamp_min <= 0:
             raise ValueError("voxel_size and scale_clamp_min must be positive")
+        if len(self.scale_anisotropy) != 3 or any(value <= 0 or not np.isfinite(value) for value in self.scale_anisotropy):
+            raise ValueError("scale_anisotropy must contain three positive finite values")
         if not 0 < self.initial_opacity < 1:
             raise ValueError("initial_opacity must be within (0, 1)")
         rates = (
@@ -72,6 +75,7 @@ class LICMappingTrainer:
             device=self.device,
             initial_opacity=self.config.initial_opacity,
             scale_clamp_min=self.config.scale_clamp_min,
+            scale_anisotropy=self.config.scale_anisotropy,
             voxel_size=self.config.voxel_size,
         )
         optimizer = self._optimizer(model)
@@ -84,6 +88,7 @@ class LICMappingTrainer:
                     optimizer=optimizer,
                     max_points=self.config.max_new_points_per_frame,
                     scale_clamp_min=self.config.scale_clamp_min,
+                    scale_anisotropy=self.config.scale_anisotropy,
                 )
             else:
                 added = 0
@@ -153,6 +158,12 @@ def _limit_frame(frame: BagFrame, limit: int) -> BagFrame:
         frame.world_from_camera,
         frame.points_world[indices],
         frame.point_colors[indices],
+        center_depth_m=frame.center_depth_m,
+        fused5_depth_m=frame.fused5_depth_m,
+        source_types=frame.source_types,
+        source_confidences=frame.source_confidences,
+        point_source_types=frame.point_source_types[indices],
+        point_source_confidences=frame.point_source_confidences[indices],
     )
 
 
@@ -181,6 +192,7 @@ def _main(argv: list[str] | None = None) -> int:
     )
     model, report = LICMappingTrainer(config, device=args.device).fit(frames)
     report["skipped_pose_frames"] = reader.skipped_pose_frames
+    report["rejected_source_frames"] = reader.rejected_source_frames
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "report": report}, args.output)
     args.output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -189,6 +201,7 @@ def _main(argv: list[str] | None = None) -> int:
         "gaussian_count": model.count,
         "frames": len(frames),
         "skipped_pose_frames": reader.skipped_pose_frames,
+        "rejected_source_frames": reader.rejected_source_frames,
     }))
     return 0
 

@@ -23,9 +23,9 @@ training:
 spnet:
   engine: null
   torchscript: null
-  weights: ../../../00_Baselines/SAGE-GS/models/Large_300.pth
-  source: ../../../00_Baselines/SAGE-GS/third_party/SPNet
+  weights: ../../../00_Baselines/SAGE-models/Large_300.pth
+  source: ../../../00_Baselines/SAGE/third_party/SPNet
   alignment: experimental_pytorch_adapter
 
 evaluation:
-  lpips_backbone: ../../../00_Baselines/SAGE-GS/models/alexnet-owt-7be5be79.pth
+  lpips_backbone: ../../../00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth

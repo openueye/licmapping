@@ -21,9 +21,10 @@ cp config/downtown1.local.example.yaml config/downtown1.local.yaml
 python -m lic_mapping.trainer --config config/downtown1.local.yaml
 ```
 
-`downtown1_sh0.yaml`–`downtown1_sh3.yaml` 是冻结的正式复现配置（SH degree
-0–3），不会被本机路径覆盖。`downtown1.local.yaml` 已为当前工作区生成并被
-Git 忽略；修改其 `training.sh_degree` 或使用 `--sh-degree 0..3` 运行本地实验。
+`downtown1_sh0.yaml`–`downtown1_sh3.yaml` 是当前工作区的正式训练配置（SH
+degree 0–3），路径已对齐本机数据和模型资产。`downtown1.local.yaml` 是被 Git
+忽略的 SH0 实验副本；修改其 `training.sh_degree` 或使用 `--sh-degree 0..3`
+运行本地实验。
 
 默认 mapping 参数：`keyframe_every=5`、`iterations_per_frame=100`、关闭
 pruning、无 Gaussian 数量上限、`scale_multiplier=1.0`。单次新增上限使用

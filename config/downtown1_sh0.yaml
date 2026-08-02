@@ -1,16 +1,19 @@
 schema_version: 1
 
 input:
-  rosbag: /home/DL/Projects/02_Thesis/03_Datasets/001_rosbags/Downtown1
-  calibration: /home/DL/Projects/02_Thesis/03_Datasets/001_rosbags/Downtown1/cam_in_ex.txt
+  rosbag: /home/haibo/Documents/Thesis/03_Datasets/001_rosbags/Downtown1
+  calibration: /home/haibo/Documents/Thesis/03_Datasets/001_rosbags/Downtown1/cam_in_ex.txt
   device: cuda
   frame_limit: null
   resize_width: 640
   resize_height: 512
+  depth_adapter: single_cloud_zbuffer
+  sync_tolerance_ms: 10.0
+  cloud_tolerance_ms: 10.0
 
 output:
-  checkpoint: /home/DL/Projects/02_Thesis/outputs/LIC_mapping/Downtown1_sh0.pt
-  artifact_dir: /home/DL/Projects/02_Thesis/outputs/LIC_mapping/Downtown1_sh0_artifacts
+  checkpoint: /home/haibo/Documents/Thesis/05_Outputs/Downtown1/licmapping/Downtown1_sh0.pt
+  artifact_dir: /home/haibo/Documents/Thesis/05_Outputs/Downtown1/licmapping/Downtown1_sh0_artifacts
   save_artifacts: true
 
 training:
@@ -44,8 +47,9 @@ training:
 spnet:
   engine: null
   torchscript: null
-  weights: /home/DL/Projects/02_Thesis/00_Baselines/SAGE-models/Large_300.pth
-  source: null
+  weights: /home/haibo/Documents/Thesis/00_Baselines/SAGE-models/Large_300.pth
+  source: /home/haibo/Documents/Thesis/00_Baselines/SAGE/third_party/SPNet
+  alignment: experimental_pytorch_adapter
 
 evaluation:
-  lpips_backbone: /home/DL/Projects/02_Thesis/00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth
+  lpips_backbone: /home/haibo/Documents/Thesis/00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth

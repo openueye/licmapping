@@ -153,7 +153,7 @@ class _KeyframeView:
 
 
 class LICMappingTrainer:
-    """Sequential fixed-pose mapper using the LIC rasterizer as its renderer."""
+    """Sequential fixed-pose mapper using SAGE's CUDA rasterizer."""
 
     def __init__(self, config: TrainingConfig, *, device: torch.device | str = "cuda", depth_completer: DepthCompleter | None = None) -> None:
         self.config = config
@@ -286,7 +286,7 @@ class LICMappingTrainer:
             "training": asdict(self.config),
             "history": records,
             "pose_optimization": "disabled",
-            "renderer": "lic_mapping._C",
+            "renderer": "sage.diff_gaussian_rasterization",
             "depth_completion": {
                 "enabled": self.config.depth_completion,
                 "backend": type(self.depth_completer).__name__ if self.depth_completer is not None else None,

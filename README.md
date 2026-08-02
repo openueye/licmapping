@@ -1,7 +1,9 @@
 # LIC mapping CUDA adapter
 
-This repository is an experimental Python/PyTorch seam around the CUDA
-rasterizer used by `06_CodeRefference/odin_gaussian_lic`.
+This repository is an experimental Python/PyTorch LIC2 mapping pipeline. Its
+default renderer is SAGE's vendored depth-capable CUDA rasterizer because the
+original LIC binding currently produces invalid RGB/alpha output in the
+working PyTorch environment.
 
 The adapter intentionally does not copy or modify the reference kernels. The
 build reads the reference source tree through `LIC_REFERENCE_SRC` (default:
@@ -10,7 +12,21 @@ extension containing the reference C++ autograd wrapper plus its CUDA sources.
 
 ## Build
 
-Use the project CUDA environment and target the local GPU architecture:
+Build the SAGE rasterizer into the same Conda environment used to run this
+repository:
+
+```bash
+conda activate licmap
+env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+  python -m pip install --no-build-isolation --no-deps \
+  /home/DL/Projects/02_Thesis/00_Baselines/SAGE/third_party/diff-gaussian-rasterization-w-depth
+```
+
+The original LIC extension remains available for isolated diagnostics, but it
+is not used by the default `lic_mapping.render` path.
+
+The legacy LIC extension can still be built for comparison with the project
+CUDA environment and local GPU architecture:
 
 ```bash
 conda activate 3dgs_train
@@ -44,6 +60,9 @@ pruning runs every five keyframes at threshold `0.01`.
 Gaussians use degree-3 SH, isotropic `2 * z / focal` scale, opacity `0.1`,
 and identity rotation. Incremental extension uses LIC2's current-window
 pixel/depth winner selection only; no global voxel deduplication is applied.
+The renderer substitution is isolated to the backend: SAGE receives the
+unchanged LIC `dc + sh_rest` tensors through its SH path, and its silhouette
+pass supplies the depth/alpha contract.
 
 ```bash
 python -m lic_mapping.trainer \
@@ -122,7 +141,8 @@ output = render(
 
 `output.rgb` is `[3, H, W]`, `output.depth` is `[H, W]`, `output.radii` is
 `[N]`, and `output.visible` is `output.radii > 0`. The returned tensors remain
-connected to PyTorch autograd through the reference CUDA backward path.
+connected to PyTorch autograd through SAGE's CUDA backward path. The training
+report records the active backend as `sage.diff_gaussian_rasterization`.
 
 The upstream `duplicateWithKeys` kernel has a one-row edge case: do not call
 this adapter with fewer than two Gaussian rows. A normal scene is far above

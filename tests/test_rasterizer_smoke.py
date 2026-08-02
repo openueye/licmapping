@@ -27,7 +27,7 @@ def test_small_scene_forward_backward() -> None:
     color = torch.tensor([[1.0, 0.2, 0.1], [0.2, 0.4, 0.8]], device=device)
     c0 = 0.28209479177387814
     dc = ((color - 0.5) / c0).view(2, 1, 3).requires_grad_()
-    sh = torch.empty((0,), dtype=torch.float32, device=device)
+    sh = torch.zeros((2, 15, 3), dtype=torch.float32, device=device, requires_grad=True)
     # LIC's rasterizer receives activated opacity; GaussianModel::getOpacity()
     # applies sigmoid before calling the C++ wrapper.
     opacities = torch.tensor([[0.5], [0.0]], device=device, requires_grad=True)
@@ -46,7 +46,7 @@ def test_small_scene_forward_backward() -> None:
         scales,
         rotations,
         camera,
-        sh_degree=0,
+        sh_degree=3,
     )
 
     assert output.rgb.shape == (3, 32, 32)
@@ -54,11 +54,13 @@ def test_small_scene_forward_backward() -> None:
     assert output.radii.shape == (2,)
     assert bool(output.visible.any())
     assert bool(torch.isfinite(output.rgb).all())
+    assert float(output.rgb.max()) > 0.01
     assert bool(torch.isfinite(output.depth).all())
     assert bool((output.depth > 0).any())
+    assert bool((1.0 - output.final_transmittance > 0.01).any())
 
     loss = output.rgb.square().mean() + output.depth.square().mean()
     loss.backward()
-    for parameter in (means3d, dc, opacities, scales, rotations):
+    for parameter in (means3d, dc, sh, opacities, scales, rotations):
         assert parameter.grad is not None
         assert bool(torch.isfinite(parameter.grad).all())

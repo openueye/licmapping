@@ -24,6 +24,10 @@ would make an end-to-end result non-comparable.
 - Apply LIC2's keyframe completion selection in Python: known-depth bias check,
   Sobel edge gate, 10-pixel patches, nearest completed depth per patch, and a
   20 m limit. Completed points carry the SAGE `SPNET_BLIND` source identity.
+- Keep Gaussian extension's native current-window pixel-depth deduplication
+  and rendered-alpha gate; do not add a global voxel deduplication layer.
+- Match LIC2's FishPoly crop/resize geometry, visibility-aware Adam update, and
+  11x11 Gaussian SSIM mapping loss in the Python loop.
 - Make final artifacts deterministic and self-describing: raw arrays and a
   binary PLY accompany PNG visualizations, and retained-keyframe image metrics
   use SAGE's local AlexNet LPIPS protocol.

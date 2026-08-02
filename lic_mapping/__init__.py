@@ -1,5 +1,6 @@
 from .rasterizer import LicCamera, LicRenderOutput, render
 from .gaussians import GaussianMap
+from .optimizers import SparseGaussianAdam
 from .rosbag import (
     BagFrame,
     CameraIntrinsics,
@@ -22,6 +23,7 @@ __all__ = [
     "BagFrame",
     "CameraIntrinsics",
     "GaussianMap",
+    "SparseGaussianAdam",
     "LicCamera",
     "LicRenderOutput",
     "RosbagReader",

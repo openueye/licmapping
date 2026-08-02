@@ -44,13 +44,12 @@ def test_fixed_pose_training_loop_accumulates_and_updates() -> None:
             replay_keyframes=0,
             max_initial_points=16,
             max_new_points_per_frame=16,
-            voxel_size=0.05,
         ),
         device="cuda",
     )
     model, report = trainer.fit(frames)
 
-    assert model.count == 5
+    assert model.count == 7
     assert report["frames"] == 2
     assert len(report["history"]) == 2
     assert all(np.isfinite(record["loss"]) for record in report["history"])

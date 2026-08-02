@@ -28,7 +28,6 @@ class GaussianMap(nn.Module):
         *,
         sh_rest: torch.Tensor | None = None,
         sh_degree: int = 3,
-        voxel_size: float = 0.05,
         source_types: torch.Tensor | None = None,
         source_confidences: torch.Tensor | None = None,
     ) -> None:
@@ -54,10 +53,6 @@ class GaussianMap(nn.Module):
             source_confidences = torch.ones(count, dtype=torch.float32, device=means3d.device)
         self.register_buffer("source_types", source_types.to(device=means3d.device, dtype=torch.uint8).contiguous())
         self.register_buffer("source_confidences", source_confidences.to(device=means3d.device, dtype=torch.float32).contiguous())
-        self.voxel_size = float(voxel_size)
-        if not math.isfinite(self.voxel_size) or self.voxel_size <= 0:
-            raise ValueError("voxel_size must be positive and finite")
-        self._voxel_keys: set[tuple[int, int, int]] = set()
         self._validate()
 
     @classmethod
@@ -71,7 +66,6 @@ class GaussianMap(nn.Module):
         scale_anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0),
         scale_multiplier: float = 2.0,
         sh_degree: int = 3,
-        voxel_size: float = 0.05,
     ) -> "GaussianMap":
         if not 0.0 < initial_opacity < 1.0:
             raise ValueError("initial_opacity must be within (0, 1)")
@@ -103,14 +97,9 @@ class GaussianMap(nn.Module):
             torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=target).repeat(len(points), 1),
             sh_rest=torch.zeros((len(points), (sh_degree + 1) ** 2 - 1, 3), dtype=torch.float32, device=target),
             sh_degree=sh_degree,
-            voxel_size=voxel_size,
             source_types=torch.from_numpy(frame.point_source_types).to(target),
             source_confidences=torch.from_numpy(frame.point_source_confidences).to(target),
         )
-        model._voxel_keys = {
-            tuple(np.floor(point / model.voxel_size).astype(np.int64).tolist())
-            for point in frame.points_world
-        }
         return model
 
     @property
@@ -161,11 +150,9 @@ class GaussianMap(nn.Module):
             alpha_gate=alpha_gate,
             pixel_dedup=pixel_dedup,
         )
-        indices = self._new_point_indices(
-            frame.points_world,
-            max_points=max_points,
-            candidate_indices=candidate_indices,
-        )
+        if max_points is not None and max_points < 1:
+            raise ValueError("max_points must be positive")
+        indices = candidate_indices if max_points is None else candidate_indices[:max_points]
         if not len(indices):
             return 0
         candidate = BagFrame(
@@ -269,28 +256,6 @@ class GaussianMap(nn.Module):
             keep &= alpha[clipped_v, clipped_u] < 0.99
         return selected[keep]
 
-    def _new_point_indices(
-        self,
-        points: np.ndarray,
-        *,
-        max_points: int | None,
-        candidate_indices: np.ndarray | None = None,
-    ) -> np.ndarray:
-        if max_points is not None and max_points < 1:
-            raise ValueError("max_points must be positive")
-        indices: list[int] = []
-        source_indices = np.arange(len(points), dtype=np.int64) if candidate_indices is None else np.asarray(candidate_indices)
-        for index in source_indices:
-            point = np.asarray(points)[index]
-            key = tuple(np.floor(point / self.voxel_size).astype(np.int64).tolist())
-            if key in self._voxel_keys:
-                continue
-            self._voxel_keys.add(key)
-            indices.append(index)
-            if max_points is not None and len(indices) >= max_points:
-                break
-        return np.asarray(indices, dtype=np.int64)
-
     def _append_tensors(self, additions: tuple[torch.Tensor, ...], optimizer: torch.optim.Optimizer) -> None:
         old_count = self.count
         old_parameters = {name: getattr(self, name) for name in self.PARAMETER_NAMES}
@@ -326,10 +291,6 @@ class GaussianMap(nn.Module):
             setattr(self, name, new)
         self.source_types = self.source_types[keep]
         self.source_confidences = self.source_confidences[keep]
-        self._voxel_keys = {
-            tuple(np.floor(point / self.voxel_size).astype(np.int64).tolist())
-            for point in self.means3d.detach().cpu().numpy()
-        }
         self._validate()
         return removed
 

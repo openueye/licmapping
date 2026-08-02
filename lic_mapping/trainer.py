@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from .gaussians import GaussianMap
+from .optimizers import SparseGaussianAdam
 from .rosbag import BagFrame, RosbagReader, SOURCE_SPNET
 from .spnet import DepthCompleter, complete_keyframe_points
 
@@ -23,7 +24,6 @@ class TrainingConfig:
     replay_keyframes: int = 0  # retained for checkpoint/config compatibility; LIC2 uses all train keyframes
     max_initial_points: int | None = None
     max_new_points_per_frame: int | None = None
-    voxel_size: float = 0.05
     initial_opacity: float = 0.1
     growth_opacity: float = 0.1
     scale_clamp_min: float = 1e-4
@@ -55,8 +55,8 @@ class TrainingConfig:
             raise ValueError("max_initial_points must be at least two when specified")
         if self.max_new_points_per_frame is not None and self.max_new_points_per_frame < 1:
             raise ValueError("max_new_points_per_frame must be positive when specified")
-        if self.voxel_size <= 0 or self.scale_clamp_min <= 0:
-            raise ValueError("voxel_size and scale_clamp_min must be positive")
+        if self.scale_clamp_min <= 0:
+            raise ValueError("scale_clamp_min must be positive")
         if len(self.scale_anisotropy) != 3 or any(value <= 0 or not np.isfinite(value) for value in self.scale_anisotropy):
             raise ValueError("scale_anisotropy must contain three positive finite values")
         if not 0 < self.initial_opacity < 1 or not 0 < self.growth_opacity < 1:
@@ -174,7 +174,7 @@ class LICMappingTrainer:
         self._rng = random.Random(0)
         accumulator = _PointAccumulator.empty()
         model: GaussianMap | None = None
-        optimizer: torch.optim.Optimizer | None = None
+        optimizer: SparseGaussianAdam | None = None
         keyframes: list[_KeyframeView] = []
         records: list[dict[str, object]] = []
         accepted_frames = 0
@@ -218,7 +218,6 @@ class LICMappingTrainer:
                     scale_anisotropy=self.config.scale_anisotropy,
                     scale_multiplier=self.config.scale_multiplier,
                     sh_degree=self.config.sh_degree,
-                    voxel_size=self.config.voxel_size,
                 )
                 optimizer = self._optimizer(model)
             else:
@@ -300,8 +299,8 @@ class LICMappingTrainer:
         self.last_keyframes = keyframes
         return model, report
 
-    def _optimizer(self, model: GaussianMap) -> torch.optim.Optimizer:
-        return torch.optim.Adam([
+    def _optimizer(self, model: GaussianMap) -> SparseGaussianAdam:
+        return SparseGaussianAdam([
             {"params": [model.means3d], "lr": self.config.learning_rate_means},
             {"params": [model.dc], "lr": self.config.learning_rate_dc},
             {"params": [model.sh_rest], "lr": self.config.learning_rate_dc / 20.0},
@@ -310,7 +309,7 @@ class LICMappingTrainer:
             {"params": [model.rotations], "lr": self.config.learning_rate_rotations},
         ], eps=1e-15)
 
-    def _optimize_keyframe(self, model: GaussianMap, optimizer: torch.optim.Optimizer, keyframes: list[_KeyframeView]) -> dict[str, object]:
+    def _optimize_keyframe(self, model: GaussianMap, optimizer: SparseGaussianAdam, keyframes: list[_KeyframeView]) -> dict[str, object]:
         if not keyframes:
             raise ValueError("At least one keyframe is required")
         selected = list(keyframes)
@@ -354,6 +353,7 @@ class LICMappingTrainer:
                     f"parameter_finite={all(bool(torch.isfinite(parameter).all()) for parameter in model.parameters())}"
                 )
             loss.backward()
+            optimizer.set_visibility(output.visible.detach())
             optimizer.step()
             final_rgb = float(rgb_loss.detach())
             final_photo = float(photo_loss.detach())
@@ -368,19 +368,22 @@ class LICMappingTrainer:
 
 
 def _ssim(rendered: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if rendered.shape != target.shape or rendered.ndim != 3 or rendered.shape[0] != 3:
+        raise ValueError("RGB tensors must share [3, H, W] shape")
     rendered = rendered.unsqueeze(0)
     target = target.unsqueeze(0)
-    mu_rendered = F.avg_pool2d(rendered, 3, stride=1, padding=1)
-    mu_target = F.avg_pool2d(target, 3, stride=1, padding=1)
-    sigma_rendered = F.avg_pool2d(rendered * rendered, 3, stride=1, padding=1) - mu_rendered.square()
-    sigma_target = F.avg_pool2d(target * target, 3, stride=1, padding=1) - mu_target.square()
-    sigma_cross = F.avg_pool2d(rendered * target, 3, stride=1, padding=1) - mu_rendered * mu_target
-    c1, c2 = 0.01**2, 0.03**2
-    score = ((2 * mu_rendered * mu_target + c1) * (2 * sigma_cross + c2)) / (
-        (mu_rendered.square() + mu_target.square() + c1)
-        * (sigma_rendered + sigma_target + c2)
-    )
-    return score.clamp(0, 1).mean()
+    coordinates = torch.arange(11, dtype=rendered.dtype, device=rendered.device) - 5
+    gaussian = torch.exp(-(coordinates.square()) / (2 * 1.5**2))
+    gaussian = gaussian / gaussian.sum()
+    window = torch.outer(gaussian, gaussian).view(1, 1, 11, 11).expand(3, 1, 11, 11).contiguous()
+    mu_rendered = F.conv2d(rendered, window, padding=5, groups=3)
+    mu_target = F.conv2d(target, window, padding=5, groups=3)
+    sigma_rendered = F.conv2d(rendered * rendered, window, padding=5, groups=3) - mu_rendered.square()
+    sigma_target = F.conv2d(target * target, window, padding=5, groups=3) - mu_target.square()
+    sigma_cross = F.conv2d(rendered * target, window, padding=5, groups=3) - mu_rendered * mu_target
+    score = (((2 * mu_rendered * mu_target + 0.01**2) * (2 * sigma_cross + 0.03**2)) /
+             ((mu_rendered.square() + mu_target.square() + 0.01**2) * (sigma_rendered + sigma_target + 0.03**2))).mean()
+    return score.clamp(0, 1)
 
 
 def _keyframe_view(frame: BagFrame) -> _KeyframeView:

@@ -476,14 +476,17 @@ def parse_calibration(path: Path) -> Calibration:
     if matrix_name is None or len(matrix_values) != 16 or any(name not in params for name in required):
         raise ValueError(f"Invalid camera calibration: {path}")
     width, height = int(params["image_width"]), int(params["image_height"])
-    fx, fy = width / 2.0, height / 2.0
+    fx = float(params["A11"])
+    fy = float(params["A22"])
+    cx = float(params["u0"])
+    cy = float(params["v0"])
     map_x, map_y = _fishpoly_maps(
         width, height, float(params["A11"]), float(params.get("A12", 0.0)),
         float(params["A22"]), float(params["u0"]), float(params["v0"]),
         [float(params.get(f"k{i}", 0.0)) for i in range(2, 8)],
     )
     return Calibration(
-        CameraIntrinsics(width, height, fx, fy, width / 2.0, height / 2.0),
+        CameraIntrinsics(width, height, fx, fy, cx, cy),
         np.asarray(matrix_values, dtype=np.float64).reshape(4, 4),
         map_x,
         map_y,
@@ -492,7 +495,8 @@ def parse_calibration(path: Path) -> Calibration:
 
 def _fishpoly_maps(width: int, height: int, a11: float, a12: float, a22: float, u0: float, v0: float, coefficients: list[float]) -> tuple[np.ndarray, np.ndarray]:
     u, v = np.meshgrid(np.arange(width, dtype=np.float64), np.arange(height, dtype=np.float64))
-    x, y = (u - width / 2) / (width / 2), (v - height / 2) / (height / 2)
+    y = (v - v0) / a22
+    x = (u - u0 - a12 * y) / a11
     radius = np.sqrt(x * x + y * y)
     theta = np.arctan(radius)
     theta_distorted = theta.copy()
@@ -500,6 +504,36 @@ def _fishpoly_maps(width: int, height: int, a11: float, a12: float, a22: float, 
         theta_distorted += coefficient * theta**power
     scale = np.divide(theta_distorted, radius, out=np.ones_like(radius), where=radius > 1e-12)
     return (a11 * x * scale + a12 * y * scale + u0).astype(np.float32), (a22 * y * scale + v0).astype(np.float32)
+
+
+def _lic2_output_geometry(
+    calibration: Calibration,
+    output_size: tuple[int, int],
+) -> tuple[CameraIntrinsics, tuple[int, int, int, int]]:
+    """Reproduce LIC2's center-crop, resize, and intrinsic calculation."""
+
+    width, height = output_size
+    source_width = calibration.intrinsics.width
+    source_height = calibration.intrinsics.height
+    target_aspect = width / height
+    crop_width = source_width
+    crop_height = int(round(crop_width / target_aspect))
+    if crop_height > source_height:
+        crop_height = source_height
+        crop_width = int(round(crop_height * target_aspect))
+    crop_x = (source_width - crop_width) // 2
+    crop_y = (source_height - crop_height) // 2
+    scale_x = width / crop_width
+    scale_y = height / crop_height
+    intrinsics = CameraIntrinsics(
+        width,
+        height,
+        calibration.intrinsics.fx * scale_x,
+        calibration.intrinsics.fy * scale_y,
+        (calibration.intrinsics.cx - crop_x) * scale_x,
+        (calibration.intrinsics.cy - crop_y) * scale_y,
+    )
+    return intrinsics, (crop_x, crop_y, crop_width, crop_height)
 
 
 def _bag_shards(root: Path) -> tuple[Path, ...]:
@@ -531,20 +565,11 @@ class RosbagReader:
             raise ValueError("resize must contain positive width and height")
         self.root = Path(rosbag_dir).resolve()
         self.calibration = parse_calibration(Path(calibration_path).resolve())
-        if resize is None:
-            self.intrinsics = self.calibration.intrinsics
-        else:
-            width, height = resize
-            scale_x = width / self.calibration.intrinsics.width
-            scale_y = height / self.calibration.intrinsics.height
-            self.intrinsics = CameraIntrinsics(
-                width,
-                height,
-                self.calibration.intrinsics.fx * scale_x,
-                self.calibration.intrinsics.fy * scale_y,
-                self.calibration.intrinsics.cx * scale_x,
-                self.calibration.intrinsics.cy * scale_y,
-            )
+        output_size = resize or (
+            self.calibration.intrinsics.width,
+            self.calibration.intrinsics.height,
+        )
+        self.intrinsics, self._crop = _lic2_output_geometry(self.calibration, output_size)
         self._resize = resize
         self._images: list[_Message] = []
         self._clouds: list[_Message] = []
@@ -648,9 +673,11 @@ class RosbagReader:
             raise ValueError(f"Could not decode image {index}")
         if self.calibration.map_x is not None:
             bgr = cv2.remap(bgr, self.calibration.map_x, self.calibration.map_y, cv2.INTER_LINEAR)
+        crop_x, crop_y, crop_width, crop_height = self._crop
+        bgr = bgr[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         if self._resize is not None:
-            rgb = cv2.resize(rgb, self._resize, interpolation=cv2.INTER_AREA).astype(np.float32)
+            rgb = cv2.resize(rgb, self._resize, interpolation=cv2.INTER_LINEAR).astype(np.float32)
         rgb = np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
         try:
             world_from_base = self._poses.interpolate(timestamp, max_dt_ns=self._max_sync_dt_ns)

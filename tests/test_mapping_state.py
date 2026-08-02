@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from lic_mapping.gaussians import GaussianMap
+from lic_mapping.optimizers import SparseGaussianAdam
 from lic_mapping.rosbag import BagFrame, CameraIntrinsics, PoseTrack, SOURCE_CENTER, _decode_cloud
 from lic_mapping.spnet import CallableDepthCompleter, complete_keyframe_points
 
@@ -39,22 +40,22 @@ def test_pose_track_interpolates_translation_and_rotation() -> None:
 
 def test_gaussian_append_preserves_adam_state() -> None:
     initial = _frame(0, np.asarray([[0, 0, 2], [0.2, 0, 2], [0, 0.2, 2]], dtype=np.float32))
-    model = GaussianMap.from_frame(initial, device="cpu", voxel_size=0.05)
+    model = GaussianMap.from_frame(initial, device="cpu")
     assert model.source_types.shape == (3,)
     assert torch.all(model.source_types == int(SOURCE_CENTER))
     assert torch.allclose(model.scales, model.scales[:, :1])
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = SparseGaussianAdam(model.parameters(), eps=1e-15)
     (sum(parameter.square().mean() for parameter in model.parameters())).backward()
     optimizer.step()
 
     next_frame = _frame(1, np.asarray([[0, 0, 2], [0.4, 0, 2], [0, 0.4, 2]], dtype=np.float32))
     added = model.append_frame(next_frame, optimizer=optimizer, alpha_gate=False)
 
-    assert added == 2
-    assert model.count == 5
-    assert model.source_types.shape == (5,)
+    assert added == 3
+    assert model.count == 6
+    assert model.source_types.shape == (6,)
     assert torch.all(model.source_confidences == 1)
-    assert optimizer.state[model.means3d]["exp_avg"].shape == (5, 3)
+    assert optimizer.state[model.means3d]["exp_avg"].shape == (6, 3)
     optimizer.zero_grad(set_to_none=True)
     sum(parameter.square().mean() for parameter in model.parameters()).backward()
     optimizer.step()
@@ -131,3 +132,14 @@ def test_gaussian_state_has_no_exposure_parameter() -> None:
     model = GaussianMap.from_frame(frame, device="cpu")
     assert "exposure" not in dict(model.named_parameters())
     assert "exposure" not in model.state_dict()
+
+
+def test_sparse_adam_updates_only_visible_rows() -> None:
+    parameter = torch.nn.Parameter(torch.ones((3, 2), dtype=torch.float32))
+    optimizer = SparseGaussianAdam([{"params": [parameter], "lr": 0.1}], eps=1e-15)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.set_visibility(torch.tensor([True, False, True]))
+    optimizer.step()
+
+    assert torch.all(parameter[[0, 2]] < 1.0)
+    assert torch.allclose(parameter[1], torch.ones(2))

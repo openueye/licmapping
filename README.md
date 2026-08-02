@@ -42,8 +42,8 @@ pixel/depth deduplication and rendered-alpha `< 0.99` gating, and opacity
 pruning runs every five keyframes at threshold `0.01`.
 
 Gaussians use degree-3 SH, isotropic `2 * z / focal` scale, opacity `0.1`,
-identity rotation, and the requested outer first-wins 5 cm `floor` voxel
-deduplication:
+and identity rotation. Incremental extension uses LIC2's current-window
+pixel/depth winner selection only; no global voxel deduplication is applied.
 
 ```bash
 python -m lic_mapping.trainer \

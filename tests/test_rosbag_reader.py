@@ -7,7 +7,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lic_mapping.rosbag import CameraIntrinsics, RosbagReader, SOURCE_CENTER, _CenteredFiveProjector, _SourceSlot
+from lic_mapping.rosbag import (
+    CameraIntrinsics,
+    RosbagReader,
+    SOURCE_CENTER,
+    _CenteredFiveProjector,
+    _SourceSlot,
+    _lic2_output_geometry,
+    parse_calibration,
+)
 
 
 def _align(buffer: bytearray, alignment: int) -> None:
@@ -147,6 +155,21 @@ def test_rosbag_reader_builds_fixed_pose_frame(tmp_path: Path) -> None:
     assert frames[0].points_world.shape == (3, 3)
     assert np.count_nonzero(frames[0].depth_m) > 0
     assert np.all(frames[0].source_types[frames[0].depth_m > 0] == SOURCE_CENTER)
+
+
+def test_lic2_output_geometry_center_crops_before_resize(tmp_path: Path) -> None:
+    calibration_path = tmp_path / "cam_in_ex.txt"
+    _calibration(calibration_path)
+    calibration = parse_calibration(calibration_path)
+
+    intrinsics, crop = _lic2_output_geometry(calibration, (4, 8))
+
+    assert crop == (2, 0, 4, 8)
+    assert (intrinsics.width, intrinsics.height) == (4, 8)
+    assert np.allclose(
+        (intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy),
+        (4.0, 4.0, 2.0, 4.0),
+    )
 
 
 def test_centered_five_rejects_conflict_but_restores_center() -> None:

@@ -57,8 +57,8 @@ first keyframe initializes the map, later keyframes extend it after current-view
 pixel/depth deduplication and rendered-alpha `< 0.99` gating, and opacity
 pruning runs every five keyframes at threshold `0.01`.
 
-Gaussians use degree-3 SH, isotropic `2 * z / focal` scale, opacity `0.1`,
-and identity rotation. Incremental extension uses LIC2's current-window
+Gaussians use configurable degree-0/1/2/3 SH (degree 3 by default), isotropic
+`2 * z / focal` scale, opacity `0.1`, and identity rotation. Incremental extension uses LIC2's current-window
 pixel/depth winner selection only; no global voxel deduplication is applied.
 The renderer substitution is isolated to the backend: SAGE receives the
 unchanged LIC `dc + sh_rest` tensors through its SH path, and its silhouette
@@ -70,8 +70,13 @@ python -m lic_mapping.trainer \
   --calibration /path/to/cam_in_ex.txt \
   --output outputs/lic_mapping/checkpoint.pt \
   --resize-width 800 --resize-height 648 \
-  --iterations 30
+  --iterations 30 \
+  --sh-degree 0
 ```
+
+Run the same command with `--sh-degree 1`, `--sh-degree 2`, and
+`--sh-degree 3` to compare the four color models. Use separate checkpoint and
+artifact paths for each run.
 
 Enable the native LIC2 SPNet completion path by supplying the matching
 TensorRT engine (the engine resolution must equal the resized image):

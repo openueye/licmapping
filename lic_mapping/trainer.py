@@ -428,6 +428,8 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frame-limit", type=int, default=None)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--keyframe-every", type=int, default=8)
+    parser.add_argument("--sh-degree", type=int, choices=range(4), default=3,
+                        help="Spherical-harmonics degree for Gaussian colors (0-3)")
     parser.add_argument("--max-new-points", type=int, default=None)
     parser.add_argument("--max-gaussians", type=int, default=250_000)
     parser.add_argument("--prune-every", type=int, default=5)
@@ -455,6 +457,7 @@ def _main(argv: list[str] | None = None) -> int:
     config = TrainingConfig(
         iterations_per_frame=args.iterations,
         keyframe_every=args.keyframe_every,
+        sh_degree=args.sh_degree,
         max_new_points_per_frame=args.max_new_points,
         max_gaussians=args.max_gaussians,
         prune_every_n_keyframes=args.prune_every,

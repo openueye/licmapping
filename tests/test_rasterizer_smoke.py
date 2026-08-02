@@ -7,8 +7,9 @@ import torch
 lic_mapping = pytest.importorskip("lic_mapping")
 
 
+@pytest.mark.parametrize("sh_degree", range(4))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_small_scene_forward_backward() -> None:
+def test_small_scene_forward_backward(sh_degree: int) -> None:
     device = torch.device("cuda")
     camera = lic_mapping.LicCamera(
         width=32,
@@ -27,7 +28,12 @@ def test_small_scene_forward_backward() -> None:
     color = torch.tensor([[1.0, 0.2, 0.1], [0.2, 0.4, 0.8]], device=device)
     c0 = 0.28209479177387814
     dc = ((color - 0.5) / c0).view(2, 1, 3).requires_grad_()
-    sh = torch.zeros((2, 15, 3), dtype=torch.float32, device=device, requires_grad=True)
+    sh = torch.zeros(
+        (2, (sh_degree + 1) ** 2 - 1, 3),
+        dtype=torch.float32,
+        device=device,
+        requires_grad=sh_degree > 0,
+    )
     # LIC's rasterizer receives activated opacity; GaussianModel::getOpacity()
     # applies sigmoid before calling the C++ wrapper.
     opacities = torch.tensor([[0.5], [0.0]], device=device, requires_grad=True)
@@ -46,7 +52,7 @@ def test_small_scene_forward_backward() -> None:
         scales,
         rotations,
         camera,
-        sh_degree=3,
+        sh_degree=sh_degree,
     )
 
     assert output.rgb.shape == (3, 32, 32)
@@ -61,6 +67,9 @@ def test_small_scene_forward_backward() -> None:
 
     loss = output.rgb.square().mean() + output.depth.square().mean()
     loss.backward()
-    for parameter in (means3d, dc, sh, opacities, scales, rotations):
+    parameters = (means3d, dc, opacities, scales, rotations)
+    if sh_degree > 0:
+        parameters += (sh,)
+    for parameter in parameters:
         assert parameter.grad is not None
         assert bool(torch.isfinite(parameter.grad).all())

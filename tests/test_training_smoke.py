@@ -32,7 +32,7 @@ def _frame(index: int, points: np.ndarray) -> BagFrame:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fixed_pose_training_loop_accumulates_and_updates() -> None:
+def test_fixed_pose_training_loop_accumulates_and_updates(capsys: pytest.CaptureFixture[str]) -> None:
     frames = [
         _frame(0, np.asarray([[-0.2, 0, 2], [0.2, 0, 2], [0, -0.2, 2]], dtype=np.float32)),
         _frame(1, np.asarray([[-0.2, 0, 2], [0.2, 0, 2], [0, 0.2, 2], [0.3, 0.2, 2]], dtype=np.float32)),
@@ -53,3 +53,8 @@ def test_fixed_pose_training_loop_accumulates_and_updates() -> None:
     assert report["frames"] == 2
     assert len(report["history"]) == 2
     assert all(np.isfinite(record["loss"]) for record in report["history"])
+    output = capsys.readouterr().out
+    assert "LIC mapping start:" in output
+    assert "LIC mapping frame 1:" in output
+    assert "LIC keyframe 2:" in output
+    assert "LIC mapping complete:" in output

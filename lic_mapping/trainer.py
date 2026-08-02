@@ -5,6 +5,7 @@ import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable
 
 import numpy as np
@@ -169,6 +170,12 @@ class LICMappingTrainer:
         self.last_depth_completion: list[dict[str, object]] = []
 
     def fit(self, frames: Iterable[BagFrame]) -> tuple[GaussianMap, dict[str, object]]:
+        run_started = perf_counter()
+        print(
+            f"LIC mapping start: device={self.device}, sh_degree={self.config.sh_degree}, "
+            f"keyframe_every={self.config.keyframe_every}, iterations={self.config.iterations_per_frame}",
+            flush=True,
+        )
         torch.manual_seed(0)
         random.seed(0)
         self._rng = random.Random(0)
@@ -181,9 +188,14 @@ class LICMappingTrainer:
         keyframe_count = 0
         for frame in frames:
             accepted_frames += 1
+            print(
+                f"LIC mapping frame {accepted_frames}: source_index={frame.index}",
+                flush=True,
+            )
             accumulator.add(frame)
             if accepted_frames % self.config.keyframe_every != 0:
                 continue
+            keyframe_started = perf_counter()
             completion_record: dict[str, object] = {"enabled": self.config.depth_completion, "added": 0}
             if self.config.depth_completion:
                 assert self.depth_completer is not None
@@ -260,6 +272,16 @@ class LICMappingTrainer:
                 "depth_completion": completion_record,
             })
             records.append(loss_record)
+            elapsed = perf_counter() - run_started
+            print(
+                f"LIC keyframe {keyframe_count}: frame={frame.index}, "
+                f"gaussians={model.count}, added={added}, pruned={pruned}, "
+                f"loss={loss_record['loss']:.6f}, rgb={loss_record['rgb_loss']:.6f}, "
+                f"depth={loss_record['depth_loss']:.6f}, views={loss_record['optimized_views']}, "
+                f"step={perf_counter() - keyframe_started:.2f}s, "
+                f"rate={accepted_frames / max(elapsed, 1e-6):.2f} frames/s",
+                flush=True,
+            )
             if clear_accumulator:
                 accumulator.clear()
             del accumulated
@@ -296,6 +318,13 @@ class LICMappingTrainer:
                 "keyframes": self.last_depth_completion,
             },
         }
+        elapsed = perf_counter() - run_started
+        print(
+            f"LIC mapping complete: frames={accepted_frames}, keyframes={keyframe_count}, "
+            f"gaussians={model.count}, elapsed={elapsed:.2f}s, "
+            f"rate={accepted_frames / max(elapsed, 1e-6):.2f} frames/s",
+            flush=True,
+        )
         self.last_keyframes = keyframes
         return model, report
 

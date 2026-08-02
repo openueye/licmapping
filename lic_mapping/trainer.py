@@ -15,36 +15,36 @@ import torch.nn.functional as F
 from .gaussians import GaussianMap
 from .configuration import load_yaml_config, resolve_config_path
 from .optimizers import SparseGaussianAdam
+from .rasterizer import RENDERER_ALIGNMENT, RENDERER_ID, RENDERER_REFERENCE
 from .rosbag import BagFrame, RosbagReader, SOURCE_SPNET
 from .spnet import DepthCompleter, complete_keyframe_points
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    iterations_per_frame: int = 30
-    keyframe_every: int = 8
+    iterations_per_frame: int = 100
+    keyframe_every: int = 5
     replay_keyframes: int = 0  # retained for checkpoint/config compatibility; LIC2 uses all train keyframes
     max_initial_points: int | None = None
     max_new_points_per_frame: int | None = None
     initial_opacity: float = 0.1
     growth_opacity: float = 0.1
     scale_clamp_min: float = 1e-4
-    scale_multiplier: float = 2.0
+    scale_multiplier: float = 1.0
     scale_anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0)
     sh_degree: int = 3
-    max_gaussians: int = 250_000
     prune_opacity_threshold: float = 0.01
-    prune_every_n_keyframes: int = 5
+    prune_every_n_keyframes: int = 0
     learning_rate_means: float = 1.6e-4
     learning_rate_dc: float = 5.0e-3
     learning_rate_opacity: float = 5.0e-2
-    learning_rate_scales: float = 1.5e-2
+    learning_rate_scales: float = 5.0e-3
     learning_rate_rotations: float = 1.0e-3
     rgb_weight: float = 1.0
     lambda_dssim: float = 0.2
     optimize_depth: bool = True
     depth_weight: float = 0.005
-    iteration_decay: bool = True
+    iteration_decay: bool = False
     depth_completion: bool = False
     depth_completion_patch_size: int = 10
     depth_completion_max_depth_m: float = 20.0
@@ -67,8 +67,6 @@ class TrainingConfig:
             raise ValueError("scale_multiplier must be positive and finite")
         if self.sh_degree < 0 or self.sh_degree > 3:
             raise ValueError("sh_degree must be within [0, 3]")
-        if self.max_gaussians < 2:
-            raise ValueError("max_gaussians must be at least two")
         if self.prune_every_n_keyframes < 0 or self.prune_opacity_threshold < 0:
             raise ValueError("pruning settings are invalid")
         if self.depth_completion_patch_size < 1 or self.depth_completion_max_depth_m <= 0:
@@ -224,27 +222,18 @@ class LICMappingTrainer:
                 )
                 optimizer = self._optimizer(model)
             else:
-                if model.count < self.config.max_gaussians:
-                    remaining = self.config.max_gaussians - model.count
-                    budget = self.config.max_new_points_per_frame
-                    if budget is not None:
-                        budget = min(budget, remaining)
-                    assert optimizer is not None
-                    added = model.append_frame(
-                        accumulated,
-                        optimizer=optimizer,
-                        max_points=budget,
-                        scale_clamp_min=self.config.scale_clamp_min,
-                        scale_anisotropy=self.config.scale_anisotropy,
-                        scale_multiplier=self.config.scale_multiplier,
-                        growth_opacity=self.config.growth_opacity,
-                        alpha_gate=True,
-                        pixel_dedup=True,
-                    )
-                else:
-                    # LIC2 keeps Dataset::pointcloud_ when the hard cap blocks
-                    # extend(), so pruning can release space for the next keyframe.
-                    clear_accumulator = False
+                assert optimizer is not None
+                added = model.append_frame(
+                    accumulated,
+                    optimizer=optimizer,
+                    max_points=self.config.max_new_points_per_frame,
+                    scale_clamp_min=self.config.scale_clamp_min,
+                    scale_anisotropy=self.config.scale_anisotropy,
+                    scale_multiplier=self.config.scale_multiplier,
+                    growth_opacity=self.config.growth_opacity,
+                    alpha_gate=True,
+                    pixel_dedup=True,
+                )
             keyframes.append(_keyframe_view(frame))
             keyframe_count += 1
             assert model is not None and optimizer is not None
@@ -296,7 +285,9 @@ class LICMappingTrainer:
             "training": asdict(self.config),
             "history": records,
             "pose_optimization": "disabled",
-            "renderer": "sage.diff_gaussian_rasterization",
+            "renderer": RENDERER_ID,
+            "renderer_alignment": RENDERER_ALIGNMENT,
+            "renderer_reference": RENDERER_REFERENCE,
             "depth_completion": {
                 "enabled": self.config.depth_completion,
                 "backend": type(self.depth_completer).__name__ if self.depth_completer is not None else None,
@@ -442,7 +433,6 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sh-degree", type=int, choices=range(4), default=None,
                         help="Spherical-harmonics degree for Gaussian colors (0-3)")
     parser.add_argument("--max-new-points", type=int, default=None)
-    parser.add_argument("--max-gaussians", type=int, default=None)
     parser.add_argument("--prune-every", type=int, default=None)
     parser.add_argument("--prune-opacity", type=float, default=None)
     parser.add_argument("--spnet-engine", type=Path, default=None)
@@ -500,7 +490,6 @@ def _main(argv: list[str] | None = None) -> int:
         "iterations_per_frame": args.iterations,
         "keyframe_every": args.keyframe_every,
         "max_new_points_per_frame": args.max_new_points,
-        "max_gaussians": args.max_gaussians,
         "prune_every_n_keyframes": args.prune_every,
         "prune_opacity_threshold": args.prune_opacity,
         "sh_degree": args.sh_degree,

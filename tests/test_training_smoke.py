@@ -58,6 +58,8 @@ def test_fixed_pose_training_loop_accumulates_and_updates(capsys: pytest.Capture
     assert model.count > 3
     assert report["frames"] == 20
     assert len(report["history"]) == 20
+    assert any(record["added"] > 0 for record in report["history"][1:])
+    assert report["renderer_alignment"] == "approximate_substitution"
     assert all(np.isfinite(record["loss"]) for record in report["history"])
     output = capsys.readouterr().out
     assert "LIC keyframe 20: frame=19" in output

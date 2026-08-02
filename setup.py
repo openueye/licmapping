@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_REFERENCE = (
     ROOT.parents[1]
     / "06_CodeRefference"
-    / "odin_gaussian_lic"
+    / "Gaussian-LIC"
     / "src"
 )
 REFERENCE_SRC = Path(
@@ -22,7 +22,7 @@ REFERENCE_SRC = Path(
 if not (REFERENCE_SRC / "rasterizer" / "rasterizer.cpp").is_file():
     raise RuntimeError(
         "LIC reference source is missing. Set LIC_REFERENCE_SRC to "
-        "06_CodeRefference/odin_gaussian_lic/src."
+        "06_CodeRefference/Gaussian-LIC/src."
     )
 
 RASTERIZER_SRC = REFERENCE_SRC / "rasterizer"

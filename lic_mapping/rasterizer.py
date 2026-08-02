@@ -8,6 +8,12 @@ import sys
 
 import torch
 
+
+RENDERER_ID = "sage.diff_gaussian_rasterization"
+RENDERER_ALIGNMENT = "approximate_substitution"
+RENDERER_REFERENCE = "Gaussian-LIC/src/rasterizer"
+
+
 @dataclass(frozen=True)
 class LicCamera:
     """Camera tensors using the same column-major convention as LIC."""
@@ -235,7 +241,7 @@ def render(
     debug: bool = False,
     no_color: bool = False,
 ) -> LicRenderOutput:
-    """Render the LIC map through SAGE's depth-capable CUDA rasterizer.
+    """Render the LIC map through SAGE's approximate CUDA substitution.
 
     The mapping state remains LIC-native: ``dc`` and ``sh`` are concatenated
     and sent through SAGE's SH path, so gradients still reach both color

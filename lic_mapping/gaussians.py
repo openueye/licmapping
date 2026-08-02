@@ -64,7 +64,7 @@ class GaussianMap(nn.Module):
         initial_opacity: float = 0.1,
         scale_clamp_min: float = 1e-4,
         scale_anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        scale_multiplier: float = 2.0,
+        scale_multiplier: float = 1.0,
         sh_degree: int = 3,
     ) -> "GaussianMap":
         if not 0.0 < initial_opacity < 1.0:
@@ -136,7 +136,7 @@ class GaussianMap(nn.Module):
         max_points: int | None = None,
         scale_clamp_min: float = 1e-4,
         scale_anisotropy: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        scale_multiplier: float = 2.0,
+        scale_multiplier: float = 1.0,
         growth_opacity: float = 0.1,
         alpha_gate: bool = True,
         pixel_dedup: bool = True,

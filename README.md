@@ -1,13 +1,17 @@
+licmap 是这个代码库的运行环境
+3dgs_train 只是项目约定的 pytest 环境
+
 # LIC mapping CUDA adapter
 
 This repository is an experimental Python/PyTorch LIC2 mapping pipeline. Its
-default renderer is SAGE's vendored depth-capable CUDA rasterizer because the
-original LIC binding currently produces invalid RGB/alpha output in the
-working PyTorch environment.
+default renderer is SAGE's vendored depth-capable CUDA rasterizer as an
+explicit approximate substitution because the original LIC binding currently
+produces invalid RGB/alpha output in the working PyTorch environment. This
+does not claim numerical or CUDA-kernel equivalence with Gaussian-LIC.
 
 The adapter intentionally does not copy or modify the reference kernels. The
 build reads the reference source tree through `LIC_REFERENCE_SRC` (default:
-`../../06_CodeRefference/odin_gaussian_lic/src`) and compiles a small PyTorch
+`../../06_CodeRefference/Gaussian-LIC/src`) and compiles a small PyTorch
 extension containing the reference C++ autograd wrapper plus its CUDA sources.
 
 ## Build
@@ -78,17 +82,19 @@ The resulting mapping depth uses the center source wherever available and the
 centered-five source only to fill center holes. Its source type and confidence
 (`1.0` for center, `0.7` for fused-five) are retained through Gaussian
 initialization and append. The LIC2 lifecycle is reproduced: all accepted
-frames accumulate source points, only every eighth frame is a keyframe, the
+frames accumulate source points, only every fifth frame is a keyframe, the
 first keyframe initializes the map, later keyframes extend it after current-view
 pixel/depth deduplication and rendered-alpha `< 0.99` gating, and opacity
-pruning runs every five keyframes at threshold `0.01`.
+pruning is disabled by default. An explicit per-keyframe new-point cap or
+pruning interval can still be supplied for controlled ablations.
 
 Gaussians use configurable degree-0/1/2/3 SH (degree 3 by default), isotropic
-`2 * z / focal` scale, opacity `0.1`, and identity rotation. Incremental extension uses LIC2's current-window
+`z / focal` scale, opacity `0.1`, and identity rotation. Incremental extension uses LIC2's current-window
 pixel/depth winner selection only; no global voxel deduplication is applied.
-The renderer substitution is isolated to the backend: SAGE receives the
-unchanged LIC `dc + sh_rest` tensors through its SH path, and its silhouette
-pass supplies the depth/alpha contract.
+The renderer substitution is isolated to the backend and is recorded in each
+training report as `renderer_alignment: approximate_substitution`: SAGE
+receives the unchanged LIC `dc + sh_rest` tensors through its SH path, and its
+silhouette pass supplies the depth/alpha contract.
 
 ```bash
 python -m lic_mapping.trainer \
@@ -96,7 +102,7 @@ python -m lic_mapping.trainer \
   --calibration /path/to/cam_in_ex.txt \
   --output outputs/lic_mapping/checkpoint.pt \
   --resize-width 800 --resize-height 648 \
-  --iterations 30 \
+  --iterations 100 \
   --sh-degree 0
 ```
 
@@ -143,6 +149,13 @@ accumulation plus keyframe cameras. The CLI reports pose and source-slot
 rejection counts in its JSON output and records them in the checkpoint report;
 image, point-cloud, and calibration decode errors remain hard failures.
 
+For mapping-core comparisons, `BagFrame` is the canonical frame-level input
+contract: the same `rgb`, metric `depth_m`, world-frame `points_world` and
+`point_colors`, `world_from_camera` pose, and camera intrinsics must be replayed
+to each core. The deterministic replay in
+`tests/fixtures/fixed_mapping_frames.json` exercises this contract without
+re-reading or re-fusing the ROSBAG.
+
 At the end of a CLI run, `<output-stem>_artifacts/` contains `metrics.json`
 (per-keyframe and aggregate PSNR/SSIM/depth/alpha metrics), rendered and target
 RGB PNGs, depth arrays/colour maps, alpha and absolute-error maps, and
@@ -175,12 +188,25 @@ output = render(
 `output.rgb` is `[3, H, W]`, `output.depth` is `[H, W]`, `output.radii` is
 `[N]`, and `output.visible` is `output.radii > 0`. The returned tensors remain
 connected to PyTorch autograd through SAGE's CUDA backward path. The training
-report records the active backend as `sage.diff_gaussian_rasterization`.
+report records the active backend as `sage.diff_gaussian_rasterization`, with
+`renderer_alignment: approximate_substitution` and
+`renderer_reference: Gaussian-LIC/src/rasterizer`.
 
 The upstream `duplicateWithKeys` kernel has a one-row edge case: do not call
 this adapter with fewer than two Gaussian rows. A normal scene is far above
 that limit; a pruning loop should stop before reaching one row or handle that
 case outside the reference rasterizer.
+
+The SAGE adapter parity test can be run with:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 conda run -n licmap python -m pytest -q \
+  tests/test_mapping_contract.py tests/test_sage_parity.py
+```
+
+It compares RGB, depth, alpha, radii, and gradients against direct calls to
+the rebuilt SAGE extension. This is adapter-to-SAGE parity only; it is not a
+claim of numerical parity with the Gaussian-LIC rasterizer.
 
 ## Source and license boundary
 

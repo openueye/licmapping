@@ -14,7 +14,7 @@ _SECTION_KEYS = {
     "training": {
         "iterations_per_frame", "keyframe_every", "replay_keyframes", "max_initial_points",
         "max_new_points_per_frame", "initial_opacity", "growth_opacity", "scale_clamp_min",
-        "scale_multiplier", "scale_anisotropy", "sh_degree", "max_gaussians",
+        "scale_multiplier", "scale_anisotropy", "sh_degree",
         "prune_opacity_threshold", "prune_every_n_keyframes", "learning_rate_means",
         "learning_rate_dc", "learning_rate_opacity", "learning_rate_scales",
         "learning_rate_rotations", "rgb_weight", "lambda_dssim", "optimize_depth",

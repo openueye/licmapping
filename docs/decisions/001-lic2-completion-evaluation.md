@@ -6,8 +6,10 @@ Accepted
 
 ## Context
 
-The Python mapping baseline already owns the LIC CUDA rasterizer and the fixed-
-pose streaming ROSBAG lifecycle. LIC2 additionally performs keyframe-only
+The Python mapping baseline owns the fixed-pose streaming ROSBAG lifecycle and
+uses SAGE's depth-capable CUDA rasterizer as an explicit approximate
+substitution. This does not claim Gaussian-LIC kernel or numerical parity.
+LIC2 additionally performs keyframe-only
 SPNet depth completion and writes training-view quality/visualization
 artifacts. The workspace does not contain
 a distributable SPNet engine or weights, so silently using an approximation
@@ -28,6 +30,9 @@ would make an end-to-end result non-comparable.
   and rendered-alpha gate; do not add a global voxel deduplication layer.
 - Match LIC2's FishPoly crop/resize geometry, visibility-aware Adam update, and
   11x11 Gaussian SSIM mapping loss in the Python loop.
+- Record the active SAGE renderer as `approximate_substitution` in training
+  reports; keep the native Gaussian-LIC extension available only for explicit
+  diagnostics.
 - Make final artifacts deterministic and self-describing: raw arrays and a
   binary PLY accompany PNG visualizations, and retained-keyframe image metrics
   use SAGE's local AlexNet LPIPS protocol.

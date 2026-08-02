@@ -1,0 +1,52 @@
+schema_version: 1
+
+input:
+  rosbag: /home/DL/Projects/02_Thesis/03_Datasets/001_rosbags/Downtown1
+  calibration: /home/DL/Projects/02_Thesis/03_Datasets/001_rosbags/Downtown1/cam_in_ex.txt
+  device: cuda
+  frame_limit: null
+  resize_width: 640
+  resize_height: 512
+
+output:
+  checkpoint: /home/DL/Projects/02_Thesis/outputs/LIC_mapping/Downtown1_sh3.pt
+  artifact_dir: /home/DL/Projects/02_Thesis/outputs/LIC_mapping/Downtown1_sh3_artifacts
+  save_artifacts: true
+
+training:
+  iterations_per_frame: 30
+  keyframe_every: 8
+  replay_keyframes: 0
+  max_initial_points: null
+  max_new_points_per_frame: null
+  initial_opacity: 0.1
+  growth_opacity: 0.1
+  scale_clamp_min: 0.0001
+  scale_multiplier: 2.0
+  scale_anisotropy: [1.0, 1.0, 1.0]
+  sh_degree: 3
+  max_gaussians: 250000
+  prune_opacity_threshold: 0.01
+  prune_every_n_keyframes: 5
+  learning_rate_means: 0.00016
+  learning_rate_dc: 0.005
+  learning_rate_opacity: 0.05
+  learning_rate_scales: 0.015
+  learning_rate_rotations: 0.001
+  rgb_weight: 1.0
+  lambda_dssim: 0.2
+  optimize_depth: true
+  depth_weight: 0.005
+  iteration_decay: true
+  depth_completion_patch_size: 10
+  depth_completion_max_depth_m: 20.0
+  depth_completion_confidence: 0.4
+
+spnet:
+  engine: null
+  torchscript: null
+  weights: /home/DL/Projects/02_Thesis/00_Baselines/SAGE-models/Large_300.pth
+  source: null
+
+evaluation:
+  lpips_backbone: /home/DL/Projects/02_Thesis/00_Baselines/SAGE-models/alexnet-owt-7be5be79.pth

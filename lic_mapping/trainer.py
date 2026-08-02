@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .gaussians import GaussianMap
+from .configuration import load_yaml_config, resolve_config_path
 from .optimizers import SparseGaussianAdam
 from .rosbag import BagFrame, RosbagReader, SOURCE_SPNET
 from .spnet import DepthCompleter, complete_keyframe_points
@@ -430,89 +431,160 @@ def _limit_frame(frame: BagFrame, limit: int | None) -> BagFrame:
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train a fixed-pose LIC Gaussian map from an Odin ROSBAG")
-    parser.add_argument("--rosbag", type=Path, required=True)
-    parser.add_argument("--calibration", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--config", type=Path, default=None, help="YAML experiment configuration")
+    parser.add_argument("--rosbag", type=Path, default=None)
+    parser.add_argument("--calibration", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--frame-limit", type=int, default=None)
-    parser.add_argument("--iterations", type=int, default=30)
-    parser.add_argument("--keyframe-every", type=int, default=8)
-    parser.add_argument("--sh-degree", type=int, choices=range(4), default=3,
+    parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--keyframe-every", type=int, default=None)
+    parser.add_argument("--sh-degree", type=int, choices=range(4), default=None,
                         help="Spherical-harmonics degree for Gaussian colors (0-3)")
     parser.add_argument("--max-new-points", type=int, default=None)
-    parser.add_argument("--max-gaussians", type=int, default=250_000)
-    parser.add_argument("--prune-every", type=int, default=5)
-    parser.add_argument("--prune-opacity", type=float, default=0.01)
+    parser.add_argument("--max-gaussians", type=int, default=None)
+    parser.add_argument("--prune-every", type=int, default=None)
+    parser.add_argument("--prune-opacity", type=float, default=None)
     parser.add_argument("--spnet-engine", type=Path, default=None)
     parser.add_argument("--spnet-torchscript", type=Path, default=None)
-    parser.add_argument("--spnet-patch-size", type=int, default=10)
-    parser.add_argument("--spnet-max-depth", type=float, default=20.0)
+    parser.add_argument("--spnet-patch-size", type=int, default=None)
+    parser.add_argument("--spnet-max-depth", type=float, default=None)
     parser.add_argument("--spnet-weights", type=Path, default=None)
     parser.add_argument("--spnet-source", type=Path, default=None)
     parser.add_argument("--artifact-dir", type=Path, default=None)
-    parser.add_argument("--no-artifacts", action="store_true")
+    parser.add_argument("--no-artifacts", action="store_true", default=None)
     parser.add_argument("--lpips-backbone", type=Path, default=None)
     parser.add_argument("--resize-width", type=int, default=None)
     parser.add_argument("--resize-height", type=int, default=None)
     args = parser.parse_args(argv)
+
+    loaded = load_yaml_config(args.config) if args.config is not None else {
+        "input": {}, "output": {}, "training": {}, "spnet": {}, "evaluation": {},
+        "_meta": {"path": None},
+    }
+    config_path = loaded["_meta"]["path"]
+
+    def configured(section: str, key: str, cli_value: object, default: object) -> object:
+        if cli_value is not None:
+            return cli_value
+        return loaded[section].get(key, default)
+
+    def configured_path(section: str, key: str, cli_value: object, default: object = None) -> Path | None:
+        return resolve_config_path(
+            configured(section, key, cli_value, default),
+            config_path=config_path,
+        )
+
+    rosbag = configured_path("input", "rosbag", args.rosbag)
+    calibration = configured_path("input", "calibration", args.calibration)
+    output = configured_path("output", "checkpoint", args.output)
+    if rosbag is None or calibration is None or output is None:
+        parser.error("--config or --rosbag/--calibration/--output is required")
+    device = str(configured("input", "device", args.device, "cuda"))
+    frame_limit = configured("input", "frame_limit", args.frame_limit, None)
+    resize_width = configured("input", "resize_width", args.resize_width, None)
+    resize_height = configured("input", "resize_height", args.resize_height, None)
     if (args.resize_width is None) != (args.resize_height is None):
         parser.error("--resize-width and --resize-height must be provided together")
-    resize = None if args.resize_width is None else (args.resize_width, args.resize_height)
-    backends = [args.spnet_engine, args.spnet_torchscript, args.spnet_weights]
+    if (resize_width is None) != (resize_height is None):
+        parser.error("config resize_width and resize_height must be provided together")
+    resize = None if resize_width is None else (int(resize_width), int(resize_height))
+
+    training_defaults = asdict(TrainingConfig())
+    training_values = {
+        name: loaded["training"].get(name, default)
+        for name, default in training_defaults.items()
+        if name != "depth_completion"
+    }
+    cli_training_overrides = {
+        "iterations_per_frame": args.iterations,
+        "keyframe_every": args.keyframe_every,
+        "max_new_points_per_frame": args.max_new_points,
+        "max_gaussians": args.max_gaussians,
+        "prune_every_n_keyframes": args.prune_every,
+        "prune_opacity_threshold": args.prune_opacity,
+        "sh_degree": args.sh_degree,
+    }
+    for name, value in cli_training_overrides.items():
+        if value is not None:
+            training_values[name] = value
+    training_values["scale_anisotropy"] = tuple(training_values["scale_anisotropy"])
+
+    cli_spnet = any(value is not None for value in (
+        args.spnet_engine, args.spnet_torchscript, args.spnet_weights, args.spnet_source,
+    ))
+    if cli_spnet:
+        spnet_engine = args.spnet_engine
+        spnet_torchscript = args.spnet_torchscript
+        spnet_weights = args.spnet_weights
+        spnet_source = args.spnet_source
+        spnet_patch_size = args.spnet_patch_size if args.spnet_patch_size is not None else training_values["depth_completion_patch_size"]
+        spnet_max_depth = args.spnet_max_depth if args.spnet_max_depth is not None else training_values["depth_completion_max_depth_m"]
+    else:
+        spnet_engine = configured_path("spnet", "engine", None)
+        spnet_torchscript = configured_path("spnet", "torchscript", None)
+        spnet_weights = configured_path("spnet", "weights", None)
+        spnet_source = configured_path("spnet", "source", None)
+        spnet_patch_size = configured("training", "depth_completion_patch_size", args.spnet_patch_size, 10)
+        spnet_max_depth = configured("training", "depth_completion_max_depth_m", args.spnet_max_depth, 20.0)
+    backends = [spnet_engine, spnet_torchscript, spnet_weights]
     if sum(value is not None for value in backends) > 1:
         parser.error("--spnet-engine, --spnet-torchscript, and --spnet-weights are mutually exclusive")
-    reader = RosbagReader(args.rosbag, args.calibration, resize=resize)
-    frames = reader.frames(limit=args.frame_limit)
+    training_values["depth_completion_patch_size"] = int(spnet_patch_size)
+    training_values["depth_completion_max_depth_m"] = float(spnet_max_depth)
     config = TrainingConfig(
-        iterations_per_frame=args.iterations,
-        keyframe_every=args.keyframe_every,
-        sh_degree=args.sh_degree,
-        max_new_points_per_frame=args.max_new_points,
-        max_gaussians=args.max_gaussians,
-        prune_every_n_keyframes=args.prune_every,
-        prune_opacity_threshold=args.prune_opacity,
+        **training_values,
         depth_completion=any(value is not None for value in backends),
-        depth_completion_patch_size=args.spnet_patch_size,
-        depth_completion_max_depth_m=args.spnet_max_depth,
     )
+    reader = RosbagReader(rosbag, calibration, resize=resize)
+    frames = reader.frames(limit=frame_limit)
     completer = None
-    if args.spnet_engine is not None:
+    if spnet_engine is not None:
         from .spnet import TensorRTDepthCompleter
         if resize is None:
             parser.error("--spnet-engine requires --resize-width/--resize-height")
-        completer = TensorRTDepthCompleter(args.spnet_engine, width=resize[0], height=resize[1], device=args.device)
-    elif args.spnet_torchscript is not None:
+        completer = TensorRTDepthCompleter(spnet_engine, width=resize[0], height=resize[1], device=device)
+    elif spnet_torchscript is not None:
         from .spnet import TorchScriptDepthCompleter
-        completer = TorchScriptDepthCompleter(args.spnet_torchscript, device=args.device)
-    elif args.spnet_weights is not None:
+        completer = TorchScriptDepthCompleter(spnet_torchscript, device=device)
+    elif spnet_weights is not None:
         from .spnet import SPNetDepthCompleter
         completer = SPNetDepthCompleter(
-            args.spnet_weights,
-            source_root=args.spnet_source,
-            device=args.device,
+            spnet_weights,
+            source_root=spnet_source,
+            device=device,
         )
-    trainer = LICMappingTrainer(config, device=args.device, depth_completer=completer)
+    trainer = LICMappingTrainer(config, device=device, depth_completer=completer)
     model, report = trainer.fit(frames)
     report["skipped_pose_frames"] = reader.skipped_pose_frames
     report["rejected_source_frames"] = reader.rejected_source_frames
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    artifact_dir = args.artifact_dir or args.output.with_name(f"{args.output.stem}_artifacts")
-    if not args.no_artifacts:
+    if config_path is not None:
+        report["config_file"] = str(config_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    configured_artifact_dir = configured_path("output", "artifact_dir", args.artifact_dir)
+    artifact_dir = configured_artifact_dir or output.with_name(f"{output.stem}_artifacts")
+    save_artifacts = bool(configured("output", "save_artifacts", None, True))
+    if args.no_artifacts is True:
+        save_artifacts = False
+    lpips_backbone = configured_path("evaluation", "lpips_backbone", args.lpips_backbone)
+    if not save_artifacts:
+        lpips_backbone = None
+    if save_artifacts:
         from .evaluation import evaluate_final_map
         evaluation = evaluate_final_map(
             model,
             trainer.last_keyframes,
             artifact_dir,
-            lpips_backbone=args.lpips_backbone,
+            lpips_backbone=lpips_backbone,
         )
         report["evaluation"] = {
             "artifact_dir": str(artifact_dir),
             "aggregate": evaluation["aggregate"],
         }
-    torch.save({"state_dict": model.state_dict(), "report": report}, args.output)
-    args.output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    torch.save({"state_dict": model.state_dict(), "report": report}, output)
+    output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({
-        "output": str(args.output),
+        "output": str(output),
         "gaussian_count": model.count,
         "frames": report["frames"],
         "skipped_pose_frames": reader.skipped_pose_frames,

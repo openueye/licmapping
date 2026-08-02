@@ -38,6 +38,32 @@ python -m pytest -q
 An editable install is also supported with
 `python -m pip install -e . --no-build-isolation`.
 
+## YAML experiment configurations
+
+The visible input, output, training, SPNet, and evaluation parameters are
+stored under `config/`. Four ready-to-run Downtown1 configurations select SH
+degree 0, 1, 2, or 3:
+
+```bash
+python -m lic_mapping.trainer --config config/downtown1_sh0.yaml
+```
+
+Select another degree by changing the YAML filename. The explicit CLI options
+remain available and override the corresponding YAML values, so a quick test
+can be limited without editing the experiment file:
+
+```bash
+python -m lic_mapping.trainer \
+  --config config/downtown1_sh0.yaml \
+  --frame-limit 3 \
+  --iterations 1 \
+  --keyframe-every 1 \
+  --no-artifacts
+```
+
+Relative paths in a YAML file are resolved relative to that file's directory.
+The generated report records `config_file` for experiment provenance.
+
 ## Fixed-pose ROSBAG training
 
 The mapping input reads the Odin ROS2 bag topics
